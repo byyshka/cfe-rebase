@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfe-rebase"
+version = "0.2.10"
+description = "Port 1C:Enterprise configuration extensions (CFE) onto a new vendor release: interception registry, vendor method diffs, &ИзменениеИКонтроль rebase with platform-control proof"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{name = "byyshka"}]
+keywords = ["1c", "bsl", "cfe", "extensions", "migration", "merge"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Version Control",
+]
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.0"]
+
+[project.scripts]
+cfe-rebase = "cfe_rebase.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

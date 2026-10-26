@@ -1,0 +1,3 @@
+# Test fixtures are 1C dumps and are byte-exact: BOM, CRLF, LF and mixed line endings are part of what is
+# tested. Git must never normalize line endings anywhere in this repository.
+* -text
