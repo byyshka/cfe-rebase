@@ -9,6 +9,7 @@ Skipped without the MCP SDK (pip install -e ".[mcp]"); the install hint of `cfe-
 import asyncio
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -39,10 +40,10 @@ COMMON = "CommonModules/ЗаказыСервер/Ext/Module.bsl"
 OBJECT = "Documents/ЗаказПокупателя/Ext/ObjectModule.bsl"
 BOM = b"\xef\xbb\xbf"
 TOOL_NAMES = {"list_interceptors", "method_diff", "rebase_control", "check_control", "port_replace", "check_calls",
-              "check_queries", "applied_text", "apply_candidate", "prepare", "check_work", "check_borrowed",
-              "check_registers", "check_reads"}
+              "check_queries", "applied_text", "apply_candidate", "apply_borrow_edit", "prepare", "check_work",
+              "check_borrowed", "check_registers", "check_reads", "check_copies", "check_names"}
 # tools whose answer on the synthetic corpus may have no items: a clean work copy, no borrowed or register findings
-NO_FINDINGS = {"check_work", "check_borrowed", "check_registers", "check_reads"}
+NO_FINDINGS = {"check_work", "check_borrowed", "check_registers", "check_reads", "check_names"}
 # report fields that carry method text: none of them may reach an answer unless asked for
 TEXT_FIELDS = {"hunks", "conflict_blocks", "duplicated_unexplained", "src", "left_new", "added_to_new"}
 
@@ -99,6 +100,8 @@ class ServerTools(unittest.TestCase):
             "check_borrowed": srv.check_borrowed([EXT], OLD, NEW, cls.out),
             "check_registers": srv.check_registers([EXT], OLD, NEW, cls.out),
             "check_reads": srv.check_reads([EXT], OLD, NEW, cls.out),
+            "check_copies": srv.check_copies([EXT], OLD, NEW, cls.out),
+            "check_names": srv.check_names([EXT], OLD, NEW, cls.out),
         }
 
     @classmethod
@@ -218,6 +221,24 @@ class ServerTools(unittest.TestCase):
             self.assertEqual(it["result"], "pass" if it["verdict"] in ("UNCHANGED", "ALREADY_NEW") else "fail")
         self.assertEqual((res["summary"]["pass"], res["summary"]["fail"]), (1, 14))
 
+    def test_control_selection(self):
+        full = self.res["check_control"]
+        fails = srv.check_control(EXT, OLD, NEW, self.out, result="fail")
+        self.assertEqual(fails["status"], "ok", fails.get("error"))
+        self.assertEqual({it["result"] for it in fails["items"]}, {"fail"})
+        self.assertEqual(len(fails["items"]), full["summary"]["fail"])
+        self.assertEqual((fails["summary"]["pass"], fails["summary"]["fail"]), (1, 14))  # counts everything
+        self.assertEqual(fails["summary"]["select"], {"filter": {"result": "fail"}, "matched": 14})
+        one = full["items"][0]
+        by_module = srv.rebase_control(EXT, OLD, NEW, self.out, module=one["module_title"], verdict=[one["verdict"]])
+        self.assertTrue(by_module["items"])
+        self.assertTrue(all(it["module_title"] == one["module_title"] and it["verdict"] == one["verdict"]
+                            for it in by_module["items"]))
+        self.assertEqual(by_module["summary"]["select"]["matched"], len(by_module["items"]))
+        self.assertNotIn("select", full["summary"])
+        bad = srv.check_control(EXT, OLD, NEW, self.out, result="maybe")
+        self.assertEqual(bad["error"]["code"], "bad_input")
+
     # -- port_replace ------------------------------------------------------------------------------------------------
     def test_port_replace(self):
         res = self.res["port_replace"]
@@ -226,6 +247,25 @@ class ServerTools(unittest.TestCase):
                          ("ПодготовитьДанныеПечати", "Синт_ПечатьПодготовитьДанныеПечати"))
         self.assertEqual(res["summary"]["conflicts"], item["conflicts"])
         self.assertTrue(os.path.isfile(item["merged"]))
+
+    # -- check_copies ------------------------------------------------------------------------------------------------
+    def test_check_copies(self):
+        res = self.res["check_copies"]
+        cases = self.full("check_copies")["cases"]
+        self.assertEqual(len(res["items"]), len(cases))
+        self.assertEqual(res["summary"]["copies"], len(cases))
+        for it, c in zip(res["items"], cases):
+            ported = c.get("basis") in ("new", "same-new") or (
+                "vendor_hunks" in c and c["vendor_in_copy"] == c["vendor_hunks"])
+            self.assertEqual(it["result"], "pass" if ported else "fail", c["copy_method"])
+            if it["result"] == "fail":
+                self.assertTrue(os.path.isfile(it["path"]))
+                self.assertEqual([h["class"] for h in it.get("missing", [])],
+                                 [h["class"] for h in c.get("three_way", []) if not h["in_copy"]])
+        older = next(it for it in res["items"] if it["target"] == "СформироватьПредставлениеЗаказа")
+        self.assertEqual((older["result"], older["basis"], older["missing"][0]["class"]),
+                         ("fail", "older", "ДРЕЙФ: копия держит текст old"))
+        self.assertEqual(res["summary"]["pass"] + res["summary"]["fail"], len(cases))
 
     # -- check_calls / check_queries ---------------------------------------------------------------------------------
     def test_check_calls_only_flagged(self):
@@ -367,7 +407,7 @@ class ServerTools(unittest.TestCase):
     def test_check_borrowed(self):
         res = self.res["check_borrowed"]
         full = self.full("check_borrowed")
-        self.assertEqual(set(res["summary"]), {"findings", "checks", "extensions", "adopted"})
+        self.assertEqual(set(res["summary"]), {"findings", "checks", "extensions", "adopted", "lists_ported"})
         self.assertEqual(res["summary"]["findings"], len(full["findings"]))
         self.assertEqual(len(res.get("items", [])), len(full["findings"]))
         self.assertEqual(res["summary"]["extensions"], len(full["extensions"]))
@@ -677,6 +717,39 @@ class PortReplaceKinds(unittest.TestCase):
             self.assertEqual(item["conflicts"], 0)
             self.assertIn("\tБ = 2;", fileio.read_lines(item["merged"]))
 
+    def write(self, d, texts):
+        paths = {}
+        for name, text in texts.items():
+            os.makedirs(os.path.join(d, name))
+            paths[name] = os.path.join(d, name, "Module.bsl")
+            with open(paths[name], "wb") as fh:
+                fh.write(BOM + text.replace("\n", "\r\n").encode("utf-8"))
+        return paths
+
+    def test_author_block_moved_and_copy_lines(self):
+        from tests.unit.test_merge_copy import CHAIN_COPY, CHAIN_NEW, CHAIN_OLD
+        with tempfile.TemporaryDirectory() as d:
+            paths = self.write(d, {"old": "\n".join(CHAIN_OLD), "new": "\n".join(CHAIN_NEW),
+                                   "copy": "&Вместо(\"П\")\n" + "\n".join(CHAIN_COPY) + "\n"})
+            res = srv.port_replace(paths["old"], paths["new"], paths["copy"], "П", os.path.join(d, "out"))
+            self.assertEqual(res["status"], "ok", res)
+            item = res["items"][0]
+            self.assertEqual(item["flags"], ["AUTHOR_BLOCK_MOVED"])
+            self.assertEqual(item["copy_lines"], [2, len(CHAIN_COPY) + 1])
+            self.assertEqual(item["author_moved"][0]["merged_line"], 14)
+            self.assertEqual(res["summary"]["author_moved"], 1)
+            self.assertGreater(item["duplicated_structural"], 0)
+            self.assertNotIn("duplicated", item)
+
+    def test_wrapper_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = self.write(d, {"old": "Процедура П()\n\tА = 1;\nКонецПроцедуры",
+                                   "new": "Процедура П()\n\tА = 2;\nКонецПроцедуры",
+                                   "copy": "&Вместо(\"П\")\nПроцедура Расш_П()\n\tПродолжитьВызов();\nКонецПроцедуры"})
+            res = srv.port_replace(paths["old"], paths["new"], paths["copy"], "П", os.path.join(d, "out"))
+            self.assertEqual(res["error"]["code"], "bad_input", res)
+            self.assertIn("ПродолжитьВызов", res["error"]["message"])
+
 
 class ControlSignature(unittest.TestCase):
     """An &ИзменениеИКонтроль with nothing to port in the body but a header that does not fit new is not a pass."""
@@ -727,6 +800,121 @@ class RegisterFields(unittest.TestCase):
             self.assertTrue(os.path.isfile(item["path"]))
 
 
+class Selection(unittest.TestCase):
+    """module / object / flag / severity, baseline and accepted of the check tools on the synthetic corpus:
+    the work copy (its extension renamed) against the dumps it was ported from."""
+    CHECKS = (srv.list_interceptors, srv.check_calls, srv.check_queries, srv.check_borrowed, srv.check_registers,
+              srv.check_reads, srv.check_work, srv.check_names)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="cfe_sel_")
+        cls.out = os.path.join(cls.tmp, "out")
+        cls.calls = srv.check_calls([EXT], OLD, NEW, cls.out)
+
+    @classmethod
+    def tearDownClass(cls):
+        rmtree(cls.tmp)
+
+    def test_parameters_are_optional(self):
+        for fn in self.CHECKS:
+            params = inspect.signature(fn).parameters
+            for name in srv.SELECT_ARGS:
+                self.assertIsNone(params[name].default, (fn.__name__, name))
+            self.assertIn("baseline", fn.__doc__)
+
+    def test_filter_applies_before_the_cap_and_summary_counts_all(self):
+        full = self.calls
+        res = srv.check_calls([EXT], OLD, NEW, self.out, module="Синт_ЗаказыСервер")
+        self.assertEqual(res["status"], "ok", res.get("error"))
+        self.assertEqual(res["summary"]["findings"], full["summary"]["findings"])
+        self.assertEqual(res["summary"]["select"]["filter"], {"module": "Синт_ЗаказыСервер"})
+        self.assertEqual(res["summary"]["select"]["matched"], len(res["items"]))
+        self.assertTrue(res["items"])
+        self.assertTrue(all(it["module_title"] == "ОбщийМодуль.Синт_ЗаказыСервер" for it in res["items"]))
+        self.assertLess(len(res["items"]), len(full["items"]))
+        with open(res["report"]["selection"]["json"], encoding="utf-8") as fh:
+            self.assertEqual(len(json.load(fh)["findings"]), len(res["items"]))
+        self.assertNotIn("select", full["summary"])
+        self.assertNotIn("selection", full["report"])
+        self.assertNotIn("key", full["items"][0])
+        flagged = srv.check_calls([EXT], OLD, NEW, self.out, flag=["TOO_FEW_ARGS"], object="Синт_ЗаказыСервер")
+        self.assertEqual([it["flags"] for it in flagged["items"]], [["TOO_FEW_ARGS"]])
+
+    def test_baseline_of_dumps_and_of_a_report_agree(self):
+        by_dump = srv.check_calls([WORK], OLD, NEW, self.out, baseline=EXT)
+        by_report = srv.check_calls([WORK], OLD, NEW, self.out,
+                                    baseline=os.path.dirname(self.calls["report"]["json"]))
+        for res in (by_dump, by_report):
+            self.assertEqual(res["status"], "ok", res.get("error"))
+            sel = res["summary"]["select"]
+            d = sel["delta"]
+            self.assertEqual(d["new"] + d["kept"], res["summary"]["findings"])
+            self.assertEqual(d["kept"] + d["gone"], self.calls["summary"]["findings"])
+            self.assertEqual(sel["renamed_ext"], {EXT_MAIN: "Синт_Основное_11_5_27_01_10_2026_v_1_0"})
+            self.assertTrue(all(it["delta"] in ("new", "kept", "gone") and it["key"] for it in res["items"]))
+            gone = [it for it in res["items"] if it["delta"] == "gone"]
+            self.assertTrue(gone)
+            self.assertEqual(res["items"][-len(gone):], gone)
+        self.assertEqual(by_dump["summary"]["select"]["delta"], by_report["summary"]["select"]["delta"])
+        # a gone row of a run on dumps has its path; of a report - the module relative to the extension
+        self.assertTrue(all(os.path.isfile(it["path"]) for it in by_dump["items"]))
+        self.assertTrue(all("module" in it for it in by_report["items"] if it["delta"] == "gone"))
+        self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(by_dump["report"]["json"]), "baseline",
+                                                    "calls.json")))
+
+    def test_baseline_is_the_root_of_a_prepare_report(self):
+        # prepare writes <folder>/<tool>/<report>.json: its root folder is a baseline of every check it ran
+        root = os.path.join(self.tmp, "prepare-root")
+        os.makedirs(os.path.join(root, "calls"), exist_ok=True)
+        shutil.copy(self.calls["report"]["json"], os.path.join(root, "calls", "calls.json"))
+        res = srv.check_calls([WORK], OLD, NEW, self.out, baseline=root)
+        self.assertEqual(res["status"], "ok", res.get("error"))
+        by_folder = srv.check_calls([WORK], OLD, NEW, self.out, baseline=os.path.join(root, "calls"))
+        self.assertEqual(res["summary"]["select"]["delta"], by_folder["summary"]["select"]["delta"])
+        self.assertFalse(os.path.isdir(os.path.join(os.path.dirname(res["report"]["json"]), "baseline")))
+
+    def test_the_same_dumps_are_all_kept(self):
+        for fn in (srv.check_queries, srv.check_borrowed, srv.list_interceptors):
+            res = fn([EXT], OLD, NEW, self.out, baseline=EXT)
+            self.assertEqual(res["status"], "ok", (fn.__name__, res.get("error")))
+            d = res["summary"]["select"]["delta"]
+            self.assertEqual((d["new"], d["gone"]), (0, 0), fn.__name__)
+
+    def test_accepted(self):
+        first = srv.check_calls([WORK], OLD, NEW, self.out, baseline=EXT)
+        target = next(it for it in first["items"] if it["delta"] != "gone")
+        path = os.path.join(self.tmp, "accepted.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump([{"key": target["key"], "reason": "вызов уходит вместе с формой"},
+                       {"key": "нет|такого|ключа", "reason": "устарело"}], fh, ensure_ascii=False)
+        res = srv.check_calls([WORK], OLD, NEW, self.out, baseline=EXT, accepted=path)
+        sel = res["summary"]["select"]
+        self.assertEqual((sel["accepted"], sel["accepted_unused"]), (1, 1))
+        self.assertEqual(sel["open"], sel["delta"]["new"] + sel["delta"]["kept"] - 1)
+        hit = [it for it in res["items"] if it.get("accepted")]
+        self.assertEqual([(it["key"], it["accepted"]) for it in hit], [(target["key"], "вызов уходит вместе с формой")])
+
+    def test_bad_selection_input(self):
+        bad_json = os.path.join(self.tmp, "bad.json")
+        with open(bad_json, "w", encoding="utf-8") as fh:
+            fh.write("[1, 2")
+        queries = srv.check_queries([EXT], OLD, NEW, self.out)
+        cases = [(srv.check_calls, {"severity": "fatal"}, "severity"),
+                 (srv.check_calls, {"baseline": "relative/calls.json"}, "must be absolute"),
+                 (srv.check_calls, {"baseline": os.path.join(self.tmp, "nope.json")}, "does not exist"),
+                 (srv.check_calls, {"baseline": queries["report"]["json"]}, "нужен calls"),
+                 (srv.check_calls, {"baseline": self.tmp}, "ни отчёта calls.json, ни выгрузок"),
+                 (srv.check_calls, {"accepted": bad_json}, "accepted")]
+        for fn, kw, words in cases:
+            res = fn([EXT], OLD, NEW, self.out, **kw)
+            self.assertEqual((res["status"], res["error"]["code"]), ("error", "bad_input"), kw)
+            self.assertIn(words, res["error"]["message"], kw)
+        res = srv.check_work(WORK, EXT, self.out, baseline=EXT)
+        self.assertEqual(res["error"]["code"], "bad_input")
+        self.assertIn("только отчёт", res["error"]["message"])
+
+
 @unittest.skipUnless(HAVE_MCP, "MCP SDK is not installed: pip install -e \".[mcp]\"")
 @unittest.skipUnless(HAVE_GIT, "git is not on PATH: control_rebase merges with git merge-file")
 class StdioTransport(unittest.TestCase):
@@ -738,7 +926,11 @@ class StdioTransport(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
 
         async def session():
-            params = StdioServerParameters(command=sys.executable, args=["-m", "cfe_rebase", "mcp"], cwd=tmp)
+            # the package the tests import, not whatever copy is installed (the default environment of the stdio
+            # client drops PYTHONPATH); the rest of this process's environment kept
+            src = os.path.dirname(os.path.dirname(os.path.abspath(srv.__file__)))
+            params = StdioServerParameters(command=sys.executable, args=["-m", "cfe_rebase", "mcp"], cwd=tmp,
+                                           env=dict(os.environ, PYTHONPATH=src))
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as s:
                     await s.initialize()

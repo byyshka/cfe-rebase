@@ -38,6 +38,7 @@
    },
    "basis": "older",
    "vendor_hunks": 1,
+   "vendor_in_copy": 0,
    "drift_hunks": 1,
    "diff_old_copy": [
     {
@@ -179,7 +180,8 @@
       5,
       4,
       5
-     ]
+     ],
+     "in_copy": false
     }
    ]
   },
@@ -218,6 +220,7 @@
    },
    "basis": "old",
    "vendor_hunks": 2,
+   "vendor_in_copy": 0,
    "drift_hunks": 2,
    "diff_old_copy": [
     {
@@ -345,7 +348,8 @@
       4,
       3,
       4
-     ]
+     ],
+     "in_copy": false
     },
     {
      "class": "ДРЕЙФ: вставки new нет в копии",
@@ -361,7 +365,8 @@
       5,
       5,
       6
-     ]
+     ],
+     "in_copy": false
     }
    ]
   }

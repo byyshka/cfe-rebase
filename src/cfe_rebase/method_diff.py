@@ -10,7 +10,8 @@ of one method (several extensions or kinds) share one set of hunks. The body is 
 parameter list to the end line: for &ИзменениеИКонтроль in the control view (lines trimmed, empty lines dropped,
 comments kept - a vendor comment edit breaks the control), otherwise in the code view (bsl.body_code: whitespace
 collapsed, comments and empty lines dropped). A worker reads these hunks instead of two whole vendor bodies; the line
-numbers point into the vendor modules. Writes <out>/report.md and <out>/report.json only.
+numbers point into the vendor modules. A body the vendor moved out (new at most a quarter of old and calling a method
+old did not) gets body_extracted (BODY_EXTRACTED of merge_copy). Writes <out>/report.md and <out>/report.json only.
 """
 import argparse
 import os
@@ -18,7 +19,7 @@ import sys
 import time
 from collections import Counter, OrderedDict
 
-from . import bsl, fileio, metadata
+from . import bsl, fileio, merge_copy, metadata
 from .control_rebase import refuse_out_inside
 
 KIND_ORDER = ("Вместо", "Перед", "После", "ИзменениеИКонтроль")
@@ -66,8 +67,12 @@ def collect(exts, only_method):
     return list(groups.values())
 
 
-def analyse(g, cfg_old, cfg_new):
-    vo, vn = cfg_old.module(g["module"]), cfg_new.module(g["module"])
+def analyse(g, cfg_old, cfg_new, ext=None):
+    """ext - the extension dump of the group: a vendor rename keeps the uuid, so the module of a renamed object is
+    looked up under its name in each release."""
+    rel_old = metadata.counterpart_rel(ext, g["module"], cfg_old)[0] if ext is not None else g["module"]
+    rel_new = metadata.counterpart_rel(ext, g["module"], cfg_new)[0] if ext is not None else g["module"]
+    vo, vn = cfg_old.module(rel_old), cfg_new.module(rel_new)
     mo = vo.find(g["target"]) if vo else None
     mn = vn.find(g["target"]) if vn else None
     g["old_lines"] = "%d-%d" % (mo.decl_line, mo.end_line) if mo else None
@@ -96,6 +101,12 @@ def analyse(g, cfg_old, cfg_new):
         g["status"] = "тело изменилось: %s, блоков %d" % (g["change"], st["hunks"])
         if control and bsl.diff_stats(view(vo, mo, False), view(vn, mn, False))["hunks"] == 0:
             g["status"] += " (только комментарии — контроль `&ИзменениеИКонтроль` всё равно ломается)"
+        extracted = merge_copy.body_extracted(vo, mo, vn, mn)
+        if extracted:
+            g["body_extracted"] = extracted
+            g["status"] += "; BODY_EXTRACTED — вендор вынес тело (строк кода %d → %d, новые вызовы: %s): %s" % (
+                extracted["old_lines"], extracted["new_lines"], ", ".join(extracted["new_calls"]),
+                merge_copy.EXTRACT_ADVICE)
     return g
 
 
@@ -167,7 +178,9 @@ def main(argv=None):
     metadata.check_config(args.old, "--old")
     metadata.check_config(args.new, "--new")
     cfg_old, cfg_new = metadata.Dump(args.old, "old"), metadata.Dump(args.new, "new")
-    groups =[analyse(g, cfg_old, cfg_new) for g in collect(exts, args.method)]
+    by_name = {e.name: e for e in exts}
+    groups = [analyse(g, cfg_old, cfg_new, by_name.get(g["interceptors"][0]["ext"]))
+              for g in collect(exts, args.method)]
     elapsed = time.time() - t0
     md_path, _ = fileio.write_report(args.out, "report", render(args, groups, elapsed), {
         "ext": args.ext, "old": args.old, "new": args.new, "only": args.only, "method": args.method,

@@ -225,7 +225,11 @@ def process(args, ext, cfg_old, cfg_new, work_dump):
 def one(args, ext, rel, mod, m, target, cfg_old, cfg_new, work_dump, qualify):
     row = OrderedDict([("ext", ext.name), ("module", rel), ("module_title", metadata.module_title(rel)),
                        ("target", target), ("ext_method", m.name), ("ext_lines", "%d-%d" % (m.start_line, m.end_line))])
-    vo, vn = cfg_old.module(rel), cfg_new.module(rel)
+    # a vendor rename keeps the uuid: the module of a renamed object is under its name in each release
+    vo = cfg_old.module(metadata.counterpart_rel(ext, rel, cfg_old)[0])
+    vn = cfg_new.module(metadata.counterpart_rel(ext, rel, cfg_new)[0])
+    # the work copy keeps the own uuid of the object when its adoption is renamed
+    wrel = metadata.counterpart_rel(ext, rel, work_dump)[0] if work_dump is not None else rel
     mo = vo.find(target) if vo else None
     mn = vn.find(target) if vn else None
     ann, ext_h, ext_body = parts(mod, m)
@@ -234,7 +238,7 @@ def one(args, ext, rel, mod, m, target, cfg_old, cfg_new, work_dump, qualify):
         row["note"] = "old: %s, new: %s" % ("есть" if mo else ("нет метода" if vo else "нет модуля"),
                                            "есть" if mn else ("нет метода" if vn else "нет модуля"))
         if work_dump is not None:
-            row["work"] = compare_work(work_dump, rel, target, m.name, None, parts(vn, mn)[2] if mn else None)
+            row["work"] = compare_work(work_dump, wrel, target, m.name, None, parts(vn, mn)[2] if mn else None)
             row["work"]["ext"] = work_dump.name
         return row
     _, old_h, old_body = parts(vo, mo)
@@ -307,7 +311,7 @@ def one(args, ext, rel, mod, m, target, cfg_old, cfg_new, work_dump, qualify):
         row["file"] = os.path.relpath(path, args.out).replace("\\", "/")
         row["replaces"] = "строки %d-%d модуля расширения" % (m.start_line, m.end_line)
     if work_dump is not None:
-        row["work"] = compare_work(work_dump, rel, target, m.name, expected, new_body)
+        row["work"] = compare_work(work_dump, wrel, target, m.name, expected, new_body)
         row["work"]["ext"] = work_dump.name
     return row
 

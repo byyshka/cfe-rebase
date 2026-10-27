@@ -404,5 +404,128 @@ class RealErpPrintForm(unittest.TestCase):
         self.assertEqual([s for s in author if " ".join(s.split()) not in merged_norm], [])
 
 
+# A real case in small: the vendor turned «Если Старое(Д)» into «Если В >= 8 … ИначеЕсли В = 7», git puts the author block
+# into the branch that keeps the old text - 0 conflicts, the 2026 documents never reach it.
+SPACER = ["\tА = 0;", "\tБ = 0;"]
+CHAIN_OLD = ["Процедура П()"] + SPACER + [
+    "\tЕсли Старое(Д) Тогда", "\t\tЕсли ФО Тогда", "\t\t\tМ = 1;", "\t\tИначе", "\t\t\tМ = 2;", "\t\tКонецЕсли;",
+    "\tКонецЕсли;", "КонецПроцедуры"]
+CHAIN_NEW = ["Процедура П()"] + SPACER + [
+    "\tЕсли В >= 8 Тогда", "\t\tЕсли ФО Тогда", "\t\t\tМ = 3;", "\t\tИначе", "\t\t\tМ = 2;", "\t\tКонецЕсли;",
+    "\tИначеЕсли В = 7 Тогда", "\t\tЕсли ФО Тогда", "\t\t\tМ = 1;", "\t\tИначе", "\t\t\tМ = 2;", "\t\tКонецЕсли;",
+    "\tКонецЕсли;", "КонецПроцедуры"]
+CHAIN_COPY = ["Процедура Расш_П()"] + SPACER + [
+    "\tЕсли Старое(Д) Тогда", "\t\tЕсли ФО Тогда", "\t\t\tМ = 1;", "\t\tИначе", "\t\t\t// ++ автор",
+    "\t\t\tЕсли Д < '20260101' Тогда", "\t\t\t\tМ = 2;", "\t\t\tИначе", "\t\t\t\tМ = 5;", "\t\t\tКонецЕсли;",
+    "\t\t\t// -- автор", "\t\tКонецЕсли;", "\tКонецЕсли;", "КонецПроцедуры"]
+
+
+class BlockPaths(unittest.TestCase):
+
+    def test_branch_headers_and_strings(self):
+        lines = ["Если А Тогда", "\tХ = \"Если Б Тогда\";", "ИначеЕсли В Тогда", "\tУ = 1;", "Иначе // Если",
+                 "\tДля Каждого С Из Т Цикл", "\t\tЗ = 1;", "\tКонецЦикла;", "КонецЕсли;", "Ф = 1;"]
+        paths = merge_copy.block_paths(lines)
+        self.assertEqual(paths[1], (("Если А", "Если А"),))  # a keyword in a string is not a block
+        self.assertEqual(paths[3], (("Если А", "ИначеЕсли В"),))
+        self.assertEqual(paths[6], (("Если А", "Иначе"), ("Для Каждого С Из Т", "Для Каждого С Из Т")))
+        self.assertEqual(paths[9], ())
+
+
+@NEEDS_GIT
+class AuthorBlockMoved(unittest.TestCase):
+
+    def test_author_block_under_a_rebuilt_condition_chain(self):
+        res = merge_copy.merge_bodies(CHAIN_OLD, CHAIN_NEW, CHAIN_COPY, auto=True)
+        self.assertEqual(res["conflicts"], 0)
+        moved = merge_copy.author_moved(CHAIN_OLD, CHAIN_COPY, res["lines"], copy_start=10)
+        self.assertEqual(len(moved), 1, moved)
+        b = moved[0]
+        self.assertEqual((b["copy_line"], b["copy_end"], b["text"]), (17, 23, "// ++ автор"))
+        self.assertEqual(res["lines"][b["merged_line"] - 1].strip(), "// ++ автор")
+        self.assertEqual(b["copy_path"], ["Если Старое(Д)", "Если ФО -> Иначе"])
+        self.assertEqual(b["merged_path"], ["Если В >= 8 -> ИначеЕсли В = 7", "Если ФО -> Иначе"])
+        # the only trace before: keyword-only duplicates, now kept apart from the real ones
+        ctl = merge_copy.control(CHAIN_OLD, CHAIN_NEW, CHAIN_COPY, res["lines"])
+        self.assertEqual(ctl["duplicated"], {"new": [], "copy": []})
+        self.assertTrue(ctl["duplicated_structural"]["new"])
+
+    def test_author_block_where_the_vendor_kept_the_conditions(self):
+        new = CHAIN_OLD[:6] + ["\t\t\tМ = 10;"] + CHAIN_OLD[7:]
+        res = merge_copy.merge_bodies(CHAIN_OLD, new, CHAIN_COPY, auto=True)
+        self.assertEqual(merge_copy.author_moved(CHAIN_OLD, CHAIN_COPY, res["lines"]), [])
+
+
+class Structural(unittest.TestCase):
+
+    def test_keyword_only_lines(self):
+        for s in ("\t\tИначе", "\tКонецЕсли;", "|", "\t|ВЫБРАТЬ", "|ИЗ", "\tКонецЦикла;", ""):
+            self.assertTrue(merge_copy.structural(s), s)
+        for s in ("СтруктураДействий = Новый Структура;", "|\tТ.Ссылка КАК Ссылка", "Иначе Х = 1;"):
+            self.assertFalse(merge_copy.structural(s), s)
+
+
+class BodyExtracted(unittest.TestCase):
+    """A real case: the vendor moved the ТОРГ-12 body into a new function and left a short call."""
+
+    OLD = "\n".join(["Функция Данные(П) Экспорт"] + ["\tА%d = Запрос%d(П);" % (k, k) for k in range(12)] +
+                    ["\tВозврат А0;", "КонецФункции"])
+    NEW = "\n".join(["Функция Данные(П) Экспорт", "\tПодготовить(П);", "\tВозврат ДанныеШапкиТЧ(П);", "КонецФункции",
+                     "", "Функция ДанныеШапкиТЧ(П)", "КонецФункции"])
+
+    def test_short_new_body_with_a_new_call(self):
+        from cfe_rebase import bsl
+        old, new = bsl.Module(self.OLD), bsl.Module(self.NEW)
+        got = merge_copy.body_extracted(old, old.find("Данные"), new, new.find("Данные"))
+        self.assertEqual(got, {"old_lines": 14, "new_lines": 3, "new_calls": ["ДанныеШапкиТЧ", "Подготовить"]})
+
+    def test_a_shorter_body_without_new_calls_is_not_extracted(self):
+        from cfe_rebase import bsl
+        old = bsl.Module(self.OLD)
+        new = bsl.Module("Функция Данные(П) Экспорт\n\tА0 = Запрос0(П);\n\tВозврат А0;\nКонецФункции")
+        self.assertIsNone(merge_copy.body_extracted(old, old.find("Данные"), new, new.find("Данные")))
+
+
+@NEEDS_GIT
+class CliFlags(unittest.TestCase):
+
+    def run_merge(self, copy_text, old="\n".join(CHAIN_OLD), new="\n".join(CHAIN_NEW)):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        paths = {}
+        for k, text in (("old", old), ("new", new), ("copy", copy_text)):
+            paths[k] = os.path.join(tmp, k, "Module.bsl")
+            os.makedirs(os.path.dirname(paths[k]))
+            with open(paths[k], "wb") as fh:
+                fh.write(b"\xef\xbb\xbf" + text.replace("\n", "\r\n").encode("utf-8"))
+        out = os.path.join(tmp, "out")
+        with contextlib.redirect_stdout(io.StringIO()):
+            merge_copy.main(["--old", paths["old"], "--new", paths["new"], "--copy", paths["copy"], "--method", "П",
+                             "--out", out])
+        name = next(f for f in os.listdir(out) if f.endswith(".json"))
+        with open(os.path.join(out, name), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_report_has_flags_and_the_copy_range(self):
+        copy = "// модуль\n\n&Вместо(\"П\")\n" + "\n".join(CHAIN_COPY) + "\n"
+        data = self.run_merge(copy)
+        self.assertEqual(data["copy_lines"], [4, 4 + len(CHAIN_COPY) - 1])
+        self.assertEqual(data["flags"], ["AUTHOR_BLOCK_MOVED"])
+        self.assertEqual(data["author_moved"][0]["copy_line"], 4 + 7)
+        self.assertIsNone(data["body_extracted"])
+
+    def test_wrapper_with_proceed_is_refused(self):
+        copy = "&Вместо(\"П\")\nПроцедура Расш_П()\n\tЕсли Условие Тогда\n\t\tПродолжитьВызов();\n\tКонецЕсли;\n" \
+               "КонецПроцедуры\n"
+        with self.assertRaises(SystemExit) as cm:
+            self.run_merge(copy)
+        self.assertIn("ПродолжитьВызов", str(cm.exception.code))
+        self.assertIn("wrapper", str(cm.exception.code))
+
+
 if __name__ == "__main__":
     unittest.main()

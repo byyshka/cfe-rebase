@@ -7,9 +7,12 @@ One item per extension + module + method (or call site / query place), grouped:
              call or a query that worked in old and does not in new, adopted metadata the vendor removed or retyped, a
              dynamic list of an adopted form whose new query drops a field of the extension, a register write that
              misses a new dimension, uses a dimension the vendor made a resource or an attribute, or goes to a
-             register the vendor removed;
-  REVIEW   - defects that were there before the update too (a call or a query that did not resolve in old either),
-             and MUST_FIX items in code nothing calls;
+             register the vendor removed, an interceptor or a call of a method the vendor made obsolete in this
+             release (TARGET_DEPRECATED / TARGET_UNCALLED, CALLS_DEPRECATED), a call into a module of an adopted
+             object the vendor removed or renamed, the extension's own method there included (OWNER_REMOVED /
+             OWNER_RENAMED);
+  REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either),
+             and MUST_FIX items in code nothing live calls (no references, or references only from such code);
   CLARIFY  - questions of design: the same target in several extensions, a base method new in this release, an
              interception of a method that was not in old, an adopted object or field in neither release, an object or
              register XML that does not parse (look at the file);
@@ -22,7 +25,7 @@ that fill dimensions through ЗаполнитьЗначенияСвойств or
 """
 from collections import Counter, OrderedDict
 
-from . import metadata
+from . import metadata, refs
 
 GROUPS = ("MUST_FIX", "REVIEW", "CLARIFY")
 GROUP_RU = OrderedDict([("MUST_FIX", "исправить"), ("REVIEW", "проверить"), ("CLARIFY", "уточнить")])
@@ -37,7 +40,11 @@ CTL_ACTION = {
 }
 INT_MUST = {"SIGNATURE_CHANGED": "сигнатура базового метода поменялась old → new",
             "SIGNATURE_MISMATCH": "сигнатура перехватчика не совпадает с базовым методом",
-            "MISSING_BASE": "перехватываемого метода в new нет"}
+            "MISSING_BASE": "перехватываемого метода в new нет",
+            "TARGET_RENAMED": "вендор переименовал объект модуля (uuid тот же) — переименовать заимствование "
+                              "(borrow-edit --rename), ссылки на старое имя в коде поправить",
+            "TARGET_UNCALLED": "вендор пометил метод устаревшим и в new его не вызывает: перехват не выполнится — "
+                               "перенести на метод, который вендор вызывает вместо него"}
 INT_CLARIFY = {"NEW_BASE": "базовый метод появился только в new",
                "CONFLICT": "одна цель перехвачена в нескольких расширениях",
                "OVERRIDDEN?": "перехват, возможно, перекрыт другим расширением (порядок подключения не задан)",
@@ -116,6 +123,10 @@ def _interceptors(p, icp):
                 shown = True
             elif f == "CONTROL_MISMATCH":
                 shown = True  # the same fact as the control_rebase verdict of this method
+            elif f == "TARGET_DEPRECATED" and (r.get("deprecated") or {}).get("grade") == "risk":
+                p.add("MUST_FIX", *args, "вендор пометил базовый метод устаревшим в new — проверить, вызывает ли он "
+                                         "его ещё", "interceptors:" + f, r.get("module_title"))
+                shown = True
             else:
                 p.hide("interceptors:" + f)
         if not shown and r.get("body_change") not in (None, "", "=") and r.get("kind") in ("Перед", "После"):
@@ -130,12 +141,21 @@ def _calls(p, calls):
         args = (f["ext"], f["module"], f.get("caller") or None)
         what = "вызов %s: %s" % (f["call"], f.get("note", ""))
         copy = f.get("copy")
+        dep_risk = (f.get("deprecated") or {}).get("grade") == "risk"
+        rest = [x for x in flags if x != "CALLS_DEPRECATED"]
         if copy and copy.get("target_in_new") and copy.get("vendor_old") and not copy.get("vendor_new"):
             p.add("MUST_FIX", *args, "в копии есть вызовы, которые вендор в new убрал — уйдут пересъёмкой копии",
                   "calls:" + ",".join(flags) + ":fixed_by_report", f.get("module_title"))
-        elif flags == ["SIGNATURE_CHANGED"] and not f.get("note", "").startswith("[риск]"):
-            p.hide("calls:SIGNATURE_CHANGED (совместимо)")
-        elif "REMOVED" in flags or "сломано обновлением" in f.get("note", "") or "SIGNATURE_CHANGED" in flags:
+        elif not rest or (rest == ["SIGNATURE_CHANGED"] and not f.get("note", "").startswith("[риск]")):
+            if dep_risk:
+                p.add("MUST_FIX", *args, what, "calls:" + ",".join(flags), f.get("module_title"))
+            elif (f.get("deprecated") or {}).get("vendor_calls_new"):
+                p.hide("calls:CALLS_DEPRECATED (вендор сам вызывает в new)")
+            else:
+                p.hide("calls:%s" % ("CALLS_DEPRECATED (устарел и в old)" if not rest else
+                                     ",".join(flags) + " (совместимо)"))
+        elif {"REMOVED", "OWNER_REMOVED", "OWNER_RENAMED", "SIGNATURE_CHANGED"} & set(flags) or \
+                "сломано обновлением" in f.get("note", ""):
             p.add("MUST_FIX", *args, what, "calls:" + ",".join(flags), f.get("module_title"))
         else:
             p.add("REVIEW", *args, what + " (было и до обновления)", "calls:" + ",".join(flags), f.get("module_title"))
@@ -200,7 +220,8 @@ def _registers(p, registers):
 def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None):
     """{'items': [...], 'counts': {group: n}, 'hidden': {kind: n}, 'not_covered': text}; items are ordered by group,
     then extension and module. A MUST_FIX item in code no extension calls (UNBOUND, or a caller without references)
-    goes to REVIEW with a note. borrowed - the report of borrowed.py (adopted metadata against new), registers - of
+    goes to REVIEW with a note; so does one whose method is referenced only from such code (refs.liveness: the
+    caller_live of calls, the method_live of queries and registers). borrowed - the report of borrowed.py (adopted metadata against new), registers - of
     registers.py (writes to registers whose structure changed); both optional."""
     p = Plan()
     _control(p, ctl)
@@ -212,7 +233,12 @@ def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None):
     _registers(p, registers)
     dead = {(d["ext"], d["module"], d["method"]) for d in (icp.get("dead_code") or {}).get("UNBOUND", [])}
     dead |= {(f["ext"], f["module"], f.get("caller") or "") for f in calls.get("findings", [])
-             if f.get("caller_live") == "ссылок в расширениях нет"}
+             if f.get("caller_live") in refs.DEAD}
+    # a query or a register write in a method nothing live calls (queries / registers: method_live)
+    dead |= {(f["ext"], f.get("file"), f["where"][len("метод "):]) for f in queries.get("findings", [])
+             if f.get("method_live") in refs.DEAD and (f.get("where") or "").startswith("метод ")}
+    dead |= {(f["ext"], f["module"], f.get("method") or "") for f in (registers or {}).get("findings", [])
+             if f.get("method_live") in refs.DEAD}
     items = []
     for key, it in p.items.items():
         group = next(g for g in GROUPS if g in it["groups"])

@@ -375,6 +375,47 @@ class FormLists(_AdoptedListForm):
                                                  borrowed.metadata.Dump(os.path.join(self.tmp, "new"), "new"))
         self.assertEqual((len(exts), findings, stats["adopted"]), (1, [], 1))
 
+    def test_both_changed_names_what_the_extension_lacks(self):
+        # the extension's query lacks the alias Ссылка the vendor's new query gives the reference
+        mine = list_attr("Список", True, "ВЫБРАТЬ Склады.Ссылка, Склады.Расш_Поле ИЗ Справочник.Склады КАК Склады")
+        found = self.checks(mine)
+        self.assertIn("в запросе расширения нет добавленного вендором: Ссылка", found[0][1])
+
+    def ported(self, ext_list, base_list=None):
+        write(os.path.join(self.ext, "Catalogs", "Склады", "Forms", "ФормаСписка", "Ext", "Form.xml"),
+              form_xml([ext_list], ("Список.Ссылка", "Список.Расш_Поле"),
+                       form_xml([base_list or self.old_list], ["Список.Ссылка"])))
+        ported = []
+        _, findings, stats = borrowed.analyze([os.path.join(self.tmp, "ext")], *(
+            borrowed.metadata.Dump(os.path.join(self.tmp, r), r) for r in ("old", "new")), ported=ported)
+        return [f["check"] for f in findings], ported, stats["lists_ported"]
+
+    def test_list_already_carrying_the_vendor_change_is_ported(self):
+        # two real extensions: the extension's own query was moved to the new vendor query, BaseForm stays the old snapshot
+        mine = list_attr("Список", True, "ВЫБРАТЬ Склады.Ссылка КАК Ссылка, Склады.Расш_Поле КАК Расш_Поле "
+                                         "ИЗ Справочник.Склады КАК Склады")
+        self.assertEqual(self.ported(mine), ([], [{"ext": "Расш", "list": "Справочник.Склады.ФормаСписка.Список"}],
+                                             1))
+
+    def test_list_reborrowed_from_new_is_ported(self):
+        mine = list_attr("Список", True, "ВЫБРАТЬ Склады.Ссылка ИЗ Справочник.Склады КАК Склады")
+        checks, ported, count = self.ported(mine, self.new_list)
+        self.assertEqual((checks, count), ([], 1))
+
+    def test_vendor_changed_only_the_fields_the_metadata_lists(self):
+        # Номенклатура in a real run: the query text is the same in old and new, only the dataset fields the platform lists
+        # from the catalog's attributes differ (a renamed attribute): the vendor did not change the list
+        query = "ВЫБРАТЬ Склады.Ссылка КАК Ссылка ИЗ Справочник.Склады КАК Склады"
+        for root, field in (("old", "Подакцизный"), ("new", "УдалитьПодакцизный")):
+            lst = list_attr("Список", True, query).replace(
+                "<MainTable>", "<Field><dataPath>%s</dataPath></Field><MainTable>" % field)
+            write(os.path.join(self.tmp, root, "Catalogs", "Склады", "Forms", "ФормаСписка", "Ext", "Form.xml"),
+                  form_xml([lst], ["Список.Ссылка"]))
+            if root == "old":
+                self.old_list = lst
+        mine = list_attr("Список", True, "ВЫБРАТЬ Склады.Ссылка, Склады.Расш_Поле ИЗ Справочник.Склады КАК Склады")
+        self.assertEqual(self.ported(mine), ([], [], 0))
+
     def test_vendor_did_not_change_the_list(self):
         write(os.path.join(self.tmp, "new", "Catalogs", "Склады", "Forms", "ФормаСписка", "Ext", "Form.xml"),
               form_xml([self.old_list], ["Список.Ссылка"]))

@@ -138,8 +138,17 @@ class Registers(unittest.TestCase):
     def test_plan(self):
         data, _ = self.run_tool()
         p = plan.build({}, {}, {}, {}, {}, None, data)
-        self.assertEqual(p["counts"], {"MUST_FIX": 3, "REVIEW": 0, "CLARIFY": 0})
+        # Удалить and Старое: nothing live in the extension calls them (method_live) - «проверить» with the dead-code note;
+        # ОбработкаПроведения is a platform event
+        self.assertEqual(p["counts"], {"MUST_FIX": 1, "REVIEW": 2, "CLARIFY": 0})
+        self.assertEqual({x["method"]: x["group"] for x in p["items"]},
+                         {"ОбработкаПроведения": "MUST_FIX", "Удалить": "REVIEW", "Старое": "REVIEW"})
+        self.assertEqual({f["method"]: f["method_live"] for f in data["findings"]},
+                         {"ОбработкаПроведения": "событие платформы",
+                          "Удалить": "вызывается только из мёртвого кода",  # from Вызов, which nothing calls
+                          "Старое": "ссылок в расширениях нет"})
         self.assertTrue(all(x["what"][0].startswith("запись в регистр РегистрСведений.Штрихкоды") for x in p["items"]))
+        self.assertTrue(all("мёртвый код" in x["what"][-1] for x in p["items"] if x["group"] == "REVIEW"))
 
     def test_dimension_that_became_a_resource_or_an_attribute(self):
         # the vendor kept Склад as a resource and Партия as an attribute: the field is there, the key and the filter of
@@ -176,7 +185,8 @@ class Registers(unittest.TestCase):
         self.assertIn("changed in new: 2", console)
         p = plan.build({}, {}, {}, {}, {}, None, data)
         item = next(x for x in p["items"] if x["method"] == "Очистить")
-        self.assertEqual((item["group"], item["sources"]), ("MUST_FIX", ["registers:key_lost"]))
+        # nothing in the extension calls Очистить: «проверить», not «исправить»
+        self.assertEqual((item["group"], item["sources"]), ("REVIEW", ["registers:key_lost"]))
 
     def test_out_inside_a_dump_is_refused(self):
         for root in (os.path.join(self.tmp, "ext"), os.path.join(self.tmp, "old"), os.path.join(self.tmp, "new")):

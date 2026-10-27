@@ -26,6 +26,12 @@ END_RE = re.compile(r"(?<![\wЁё])(КонецПроцедуры|КонецФу�
 LEAD_ANN_RE = re.compile(r"^\s*&\s*(" + IDENT + r")\s*(?:\(\s*\"((?:[^\"]|\"\")*)\"\s*\))?")
 EXPORT_RE = re.compile(r"^\s*(Экспорт|Export)(?![\wЁё])", re.IGNORECASE)
 PROCEED_RE = re.compile(r"(?<![\wЁё.])(ПродолжитьВызов|ProceedWithCall)\s*\(", re.IGNORECASE)
+# The vendor convention for an obsolete method: the region of obsolete methods or a header comment
+# starting with «Устарела.» ("//++ Устарело_Переработка24" inside a body is not one: \w follows).
+REGION_RE = re.compile(r"^\s*#\s*(?:Область|Region)\s+(" + IDENT + r")", re.IGNORECASE)
+REGION_END_RE = re.compile(r"^\s*#\s*(?:КонецОбласти|EndRegion)(?![\wЁё])", re.IGNORECASE)
+DEPRECATED_REGIONS = {"устаревшиепроцедурыифункции", "obsoleteproceduresandfunctions", "deprecated"}
+DEPRECATED_COMMENT_RE = re.compile(r"^\s*//\s*(Устарел[аои]?|Deprecated|Obsolete)(?![\wЁё])", re.IGNORECASE)
 
 # A marker may carry a trailing line comment (`#Вставка // Иванов 24.12 - причина`): the platform accepts it.
 _MARK_TAIL = r"\s*(?://.*)?$"
@@ -684,6 +690,7 @@ class Module(object):
             self.by_name.setdefault(m.name.casefold(), []).append(m)
         self._toks = None
         self._text = text
+        self._regions = None
 
     @property
     def toks(self):
@@ -696,6 +703,31 @@ class Module(object):
             return None
         lst = self.by_name.get(name.casefold())
         return lst[0] if lst else None
+
+    def deprecated(self, method):
+        """Why the vendor marks the method obsolete - "область <Имя>" (it lies in the region of obsolete methods) or
+        "комментарий «…»" (its header comment says Устарела) - or None."""
+        if self._regions is None:
+            self._regions, stack = [], []
+            for k, raw in enumerate(self.lines, 1):
+                if self.lx[k - 1].kind != "preproc":
+                    continue
+                m = REGION_RE.match(raw)
+                if m:
+                    stack.append((k, m.group(1)))
+                elif REGION_END_RE.match(raw) and stack:
+                    start, name = stack.pop()
+                    self._regions.append((start, k, name))
+            self._regions.extend((start, len(self.lines), name) for start, name in stack)
+        for start, end, name in self._regions:
+            if start <= method.decl_line <= end and name.casefold() in DEPRECATED_REGIONS:
+                return "область " + name
+        k = method.start_line - 1
+        while k >= 1 and self.lx[k - 1].kind == "comment":
+            if DEPRECATED_COMMENT_RE.match(self.lines[k - 1]):
+                return "комментарий «%s»" % self.lines[k - 1].strip().lstrip("/").strip()[:120]
+            k -= 1
+        return None
 
     def method_at_line(self, line):
         for m in self.methods:

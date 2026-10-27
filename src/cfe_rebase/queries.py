@@ -21,7 +21,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict, OrderedDict
 
-from . import fileio, metadata, qparse
+from . import fileio, metadata, qparse, refs
 from .control_rebase import refuse_out_inside
 
 SCH = "{http://v8.1c.ru/8.1/data-composition-system/schema}"
@@ -81,6 +81,7 @@ COLLECTION_METHODS = {x.casefold() for x in ("Найти", "Find", "Количе
                                              "Contains")}
 MANAGER_PROPS = {"пустаяссылка", "emptyref"}
 REPLACE_FUNCS = {"стрзаменить", "strreplace"}
+PREDEFINED_FUNCS = {"предопределенноезначение", "predefinedvalue"}
 NAMED_CALLS = {"рольдоступна": "Роль", "isinrole": "Роль", "получитьфункциональнуюопцию": "ФункциональнаяОпция",
                "getfunctionaloption": "ФункциональнаяОпция"}
 FULL_KINDS = dict(qparse.KIND_Q)
@@ -155,6 +156,17 @@ def replace_args(toks):
     return out
 
 
+def predefined_args(toks):
+    """Indexes of string tokens that are the argument of ПредопределенноеЗначение("Вид.X.Y") / PredefinedValue: a
+    value in code, not query text - glued to the query of the same method it read as a table «Вид.X.Y» (a real extension: four
+    false «нет табличной части»). The value itself is checked as a literal (literal/значение)."""
+    out = set()
+    for i, (k, v, _) in enumerate(toks):
+        if k == "id" and v.casefold() in PREDEFINED_FUNCS and i + 3 < len(toks) and toks[i + 1][1] == "("                 and toks[i + 2][0] == "str" and toks[i + 3][1] == ")":
+            out.add(i + 2)
+    return out
+
+
 def query_texts(ext):
     """(rel, where, text, strs, repl) for every live query text of one extension; strs maps back to lines, repl holds
     the casefolded identifier-like literals passed to СтрЗаменить in the same method."""
@@ -163,9 +175,10 @@ def query_texts(ext):
         if mod is None:
             continue
         repl_idx = replace_args(mod.toks)
+        skip = predefined_args(mod.toks)
         buckets = OrderedDict()
         for idx, (kind, value, line) in enumerate(mod.toks):
-            if kind != "str":
+            if kind != "str" or idx in skip:
                 continue
             m = mod.method_at_line(line)
             strs, repl = buckets.setdefault(m.name if m else "(модуль)", ([], set()))
@@ -213,6 +226,11 @@ class Sweep(object):
             old = old_ok
         else:
             old = None if old_ok is None else ("было корректно" if old_ok else "тоже не разрешается")
+        if part == "literal" and rel.lower().endswith(".bsl"):  # a literal or a code chain: the method it sits in
+            mod = ext.module(rel)
+            m = mod.method_at_line(line) if mod is not None else None
+            if m is not None:
+                where = "метод " + m.name
         self.findings.append({"part": part, "kind": kind, "sev": sev, "ext": ext.name, "file": rel, "where": where,
                               "line": line, "ref": ref, "note": note, "old": old})
 
@@ -569,6 +587,9 @@ def main(argv=None):
         sw.queries(ext)
         sw.dcs(ext)
         sw.literals(ext)
+    # can the method of a finding run at all: the plan sends a finding in dead code to «проверить»
+    refs.annotate_liveness(exts, sw.findings, "file",
+                           lambda f: f["where"][len("метод "):] if (f.get("where") or "").startswith("метод ") else None)
     elapsed = time.time() - t0
     md = render(cfg_new, cfg_old, exts, sw, elapsed)
     data = {"config_new": cfg_new.root, "config_old": cfg_old.root if cfg_old else None,

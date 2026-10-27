@@ -8,7 +8,11 @@ attribute, dimension, resource, journal column, addressing attribute, accounting
 its attributes, form, template and command must still exist in the new release, and an adopted attribute or tabular
 section attribute whose type (with string length and number digits) the extension stores must keep it in new. Checks:
   OBJECT_REMOVED  the adopted object is gone from new (in old it is there; one in neither release is NOT_IN_VENDOR)
+  OBJECT_RENAMED  the vendor renamed the adopted object (the uuid of ExtendedConfigurationObject is in new under
+                  another name, «Удалить<Имя>» included): its children are compared with the renamed object; the
+                  detail names the borrow-edit --rename call
   REMOVED         an adopted child is gone from new (vendor renaming to «Удалить<Имя>» is named in the detail)
+  RENAMED         the vendor renamed an adopted child or tabular section, keeping its uuid
   TYPE_CHANGED    the vendor changed the type old -> new; the extension still holds the old one (compared only
                   where the extension stores a copy of the old type: simple types; a composite one is a placeholder;
                   a composite type the vendor only widened is accepted by the platform and not reported; the order
@@ -32,6 +36,7 @@ For REMOVED / TYPE_* of an object or tabular section attribute, forms of that ob
 is refused.
 """
 import argparse
+import html
 import os
 import re
 import sys
@@ -46,7 +51,9 @@ BUCKETS = (("attrs", "реквизит"), ("dims", "измерение"), ("res"
 NAMED = (("forms", "форма"), ("templates", "макет"), ("commands", "команда"))
 EXPLAIN = {
     "OBJECT_REMOVED": "заимствованного объекта нет в new",
+    "OBJECT_RENAMED": "вендор переименовал заимствованный объект (uuid тот же): переименовать заимствование",
     "REMOVED": "заимствованного реквизита / ресурса / значения / формы нет в new",
+    "RENAMED": "вендор переименовал заимствованный реквизит или табличную часть (uuid тот же)",
     "TYPE_CHANGED": "вендор сменил тип old → new, в расширении старый",
     "NAME_CLASH": "собственный реквизит или табличная часть расширения совпали по имени с новым полем вендора",
     "NOT_IN_VENDOR": "заимствованного объекта или поля нет ни в old, ни в new: доработанная конфигурация или "
@@ -111,6 +118,13 @@ def _forms_binding(ext, kind, obj, name):
 LIST_ATTR_RE = re.compile(r'<Attribute name="([^"]+)"[^>]*>(.*?)</Attribute>', re.S)
 SETTINGS_RE = re.compile(r"<Settings[^>]*>(.*?)</Settings>", re.S)
 QUERY_RE = re.compile(r"<QueryText>(.*?)</QueryText>", re.S)
+# what makes a dynamic list's data: the query, whether it is manual, the main table. The rest of Settings - the
+# dataset fields the platform lists from the object's attributes, the user settings - follows the metadata and is
+# judged by the other checks (an attribute the vendor removed is REMOVED, a field a query reads is check_queries')
+LIST_KEY_RES = (QUERY_RE, re.compile(r"<ManualQuery>(.*?)</ManualQuery>", re.S),
+                re.compile(r"<MainTable>(.*?)</MainTable>", re.S))
+QUERY_IDENT_RE = re.compile(r"[A-Za-zА-Яа-яЁё_][\wЁё]*(?:\.[A-Za-zА-Яа-яЁё_][\wЁё]*)*")
+LIST_NAMES_MAX = 12  # identifiers of the vendor's change named in one LIST_CHANGED
 
 
 def _lists(part):
@@ -129,6 +143,32 @@ STANDARD_PATHS = {"Ref", "Date", "Number", "DeletionMark", "Posted", "Code", "De
                   "IsFolder", "Predefined", "PredefinedDataName", "Recorder", "Period", "LineNumber", "Active"}
 
 
+def _list_key(settings):
+    """The query text (whitespace collapsed), ManualQuery and MainTable of a list: equal keys - the vendor did not
+    change the list's data, only what follows the metadata."""
+    return tuple(" ".join(html.unescape(m.group(1)).split()) if m else None
+                 for m in (rx.search(settings or "") for rx in LIST_KEY_RES))
+
+
+def _query_idents(settings):
+    """{casefolded: as written} of the identifiers and dotted chains (Документ.X.Поле) of a list's query text."""
+    q = QUERY_RE.search(settings or "")
+    return {x.casefold(): x for x in QUERY_IDENT_RE.findall(html.unescape(q.group(1)))} if q else {}
+
+
+def _vendor_change_carried(old, new, mine):
+    """([vendor additions the extension's query lacks], [vendor removals it still has]): the identifiers and dotted
+    chains the vendor added to the list query old -> new must be in the extension's own query, the ones it removed
+    must not. Both empty: the extension's list already carries the vendor's change."""
+    o, n, m = _query_idents(old), _query_idents(new), _query_idents(mine)
+    return sorted(n[k] for k in n.keys() - o.keys() - m.keys()), sorted(o[k] for k in (o.keys() - n.keys()) & m.keys())
+
+
+def _names(items):
+    return ", ".join(items[:LIST_NAMES_MAX]) + (" и ещё %d" % (len(items) - LIST_NAMES_MAX)
+                                                if len(items) > LIST_NAMES_MAX else "")
+
+
 def _selects(query, field):
     """The query text names the field as a whole word, any case."""
     return re.search(r"(?<![\wЁё])%s(?![\wЁё])" % re.escape(field), query, re.I) is not None
@@ -141,9 +181,10 @@ def _form_parts(path):
     return main, base if sep else ""
 
 
-def check_form_lists(ext, kind, name, form, cfg_old, cfg_new):
-    """An adopted form whose dynamic list the vendor changed: the fields the extension adds to the form must still be
-    selected by the new query; a list the extension changed itself must be merged with the vendor's change."""
+def check_form_lists(ext, kind, name, form, cfg_old, cfg_new, ported=None):
+    """An adopted form whose dynamic list the vendor changed (query text, ManualQuery or MainTable): the fields the
+    extension adds to the form must still be selected by the new query; a list the extension changed itself must be
+    merged with the vendor's change - unless it already is («Форма.Список» is then appended to ported)."""
     if cfg_old is None:
         return []
     rel = "%s/%s/Forms/%s/Ext/Form.xml" % (metadata.KINDS[kind][0], name, form)
@@ -161,7 +202,7 @@ def check_form_lists(ext, kind, name, form, cfg_old, cfg_new):
     out = []
     for attr, settings in mine.items():
         key = attr.casefold()
-        if key not in old or key not in new or old[key] == new[key]:
+        if key not in old or key not in new or _list_key(old[key]) == _list_key(new[key]):
             continue
         what = "форма %s, динамический список %s: вендор изменил его настройки (запрос)" % (form, attr)
         q = QUERY_RE.search(new[key])
@@ -169,15 +210,24 @@ def check_form_lists(ext, kind, name, form, cfg_old, cfg_new):
                          if p.casefold().startswith(key + ".")} - STANDARD_PATHS)
         lost = [f for f in fields if q is not None and not _selects(q.group(1), f)]
         if settings != at_borrowing.get(key, settings):
+            # the list is ported already: re-borrowed from new (BaseForm holds the new vendor list), or the
+            # extension's own query carries every identifier the vendor added and none it removed
+            lacks, keeps = _vendor_change_carried(old[key], new[key], settings)
+            if _list_key(at_borrowing.get(key)) == _list_key(new[key]) or not (lacks or keeps):
+                if ported is not None:
+                    ported.append("%s.%s" % (form, attr))
+                continue
             # what the merge must carry over: the fields the extension's own query adds; a field its own query does
             # not select either (a standard attribute bound as Список.Ref, Список.Date) is not part of its change
             own = QUERY_RE.search(settings)
             lost = [f for f in lost if own is None or _selects(own.group(1), f)]
+            todo = (["в запросе расширения нет добавленного вендором: " + _names(lacks)] if lacks else []) + \
+                (["в нём осталось убранное вендором: " + _names(keeps)] if keeps else [])
             out.append({"part": "форма", "name": form, "check": "LIST_CHANGED",
                         "detail": what + ", и расширение меняло этот список само — перенести его правку на новые "
-                                         "настройки вендора" + ("; новый запрос вендора не выбирает поля, которые "
-                                                                "выводит расширение: %s" % ", ".join(lost)
-                                                                if lost else "")})
+                                         "настройки вендора: " + "; ".join(todo) +
+                                         ("; новый запрос вендора не выбирает поля, которые выводит расширение: %s"
+                                          % ", ".join(lost) if lost else "")})
             continue
         if lost:
             out.append({"part": "форма", "name": form, "check": "LIST_FIELD_LOST",
@@ -188,8 +238,8 @@ def check_form_lists(ext, kind, name, form, cfg_old, cfg_new):
 
 def _folded(children):
     """{casefolded name: info} of one child collection: 1C names are case-insensitive, and the vendor may change only
-    the case of a name between releases."""
-    return {k.casefold(): v for k, v in children.items()}
+    the case of a name between releases. Each info gets the name as written ("name")."""
+    return {k.casefold(): dict(v, name=k) for k, v in children.items()}
 
 
 def _unreadable(base, name, where, dump, kind):
@@ -198,8 +248,9 @@ def _unreadable(base, name, where, dump, kind):
                     where, dump.object_path(kind, name), dump.object_error(kind, name)))
 
 
-def check_object(ext, kind, name, cfg_old, cfg_new):
-    """Findings of one object of the extension (none for an object the extension owns)."""
+def check_object(ext, kind, name, cfg_old, cfg_new, ported=None):
+    """Findings of one object of the extension (none for an object the extension owns); ported - a list that gets
+    «Вид.Имя.Форма.Список» of each dynamic list both changed and the extension has already ported."""
     o = ext.object(kind, name)
     title = "%s.%s" % (kind, name)
     rel = "%s/%s.xml" % (metadata.KINDS[kind][0], name)
@@ -208,21 +259,38 @@ def check_object(ext, kind, name, cfg_old, cfg_new):
         return [_unreadable(base, name, "расширении", ext, kind)] if ext.object_error(kind, name) else []
     if not o.adopted:
         return []
-    n = cfg_new.object(kind, name)
-    old = cfg_old.object(kind, name) if cfg_old is not None else None
+    # the vendor keeps the uuid when it renames an object: the adopted one is looked up by ExtendedConfigurationObject
+    new_name = metadata.counterpart_name(ext, kind, name, cfg_new) or name
+    old_name = (metadata.counterpart_name(ext, kind, name, cfg_old) or name) if cfg_old is not None else name
+    n = cfg_new.object(kind, new_name)
+    old = cfg_old.object(kind, old_name) if cfg_old is not None else None
     # every verdict of the object rests on both releases: an unparsable one is reported, not read as «no object»
-    broken = [_unreadable(base, name, where, d, kind) for where, d in (("new", cfg_new), ("old", cfg_old))
-              if d is not None and d.object_error(kind, name)]
+    broken = [_unreadable(base, nm, where, d, kind) for where, d, nm in (("new", cfg_new, new_name),
+                                                                          ("old", cfg_old, old_name))
+              if d is not None and d.object_error(kind, nm)]
     if broken:
         return broken
+    found = []
+    if n is not None and new_name.casefold() != name.casefold():
+        inner = o.props.get("Name") or name
+        if inner.casefold() == new_name.casefold():
+            todo = "имя в XML расширения уже новое, файлы — под старым: переименовать файлы и папку"
+        else:
+            todo = "переименовать заимствование"
+        hint = "; снять заимствование, если расширение им не пользуется (cfe-rebase borrow-edit --remove %s.%s), " \
+               "иначе " % (kind, name) if new_name.casefold().startswith("удалить") else "; "
+        found.append(dict(base, part="объект", name=name, check="OBJECT_RENAMED", new_name=new_name,
+                          detail="%s%s%s: cfe-rebase borrow-edit --rename %s.%s=%s; ссылки на старое имя в коде "
+                                 "расширения (менеджер, тексты запросов) borrow-edit называет, правятся руками" % (
+                                     metadata.renamed_note(kind, name, new_name), hint, todo, kind, name, new_name)))
     if n is None:
         if old is None and cfg_old is not None:
             # in neither release (an XML that does not parse was reported above): the same question as a field there
             return [dict(base, part="объект", name=name, check="NOT_IN_VENDOR",
                          detail="объекта нет ни в old, ни в new: конфигурация базы доработана — проверить по базе")]
         return [dict(base, part="объект", name=name, check="OBJECT_REMOVED",
-                     detail="объекта нет в new" + ("" if old is None else " (в old был)"))]
-    found = []
+                     detail="объекта нет в new" + ("" if old is None else " (в old был)") +
+                     "; снять заимствование: cfe-rebase borrow-edit --remove %s.%s" % (kind, name))]
     new_fields = {x.casefold() for x in n.fields()} | {x.casefold() for x in n.enum_values}
     old_fields = {x.casefold() for x in old.fields()} | {x.casefold() for x in old.enum_values} if old else set()
 
@@ -247,6 +315,18 @@ def check_object(ext, kind, name, cfg_old, cfg_new):
                                       part, child)))
             return
         if key not in theirs:
+            # a vendor rename keeps the uuid: ExtendedConfigurationObject of the child names it in new
+            uid = (info.get("ext_uuid") or "").lower()
+            renamed = next((nm for nm, i in theirs.items() if uid and (i.get("uuid") or "").lower() == uid), None)
+            if renamed is not None:
+                to = theirs[renamed].get("name") or renamed
+                found.append(dict(base, part=part, name=child, check="RENAMED", new_name=to,
+                                  detail="%s %s: вендор переименовал в %s (uuid тот же)%s — переименовать в "
+                                         "заимствовании и в коде и формах расширения" % (
+                                             part, child, to, ", пометил к удалению"
+                                             if to.casefold().startswith("удалить") else ""),
+                                  forms=_forms_binding(ext, kind, name, child) if forms_of else []))
+                return
             if old is not None and key not in before:
                 found.append(dict(base, part=part, name=child, check="NOT_IN_VENDOR",
                                   detail="%s %s нет ни в old, ни в new: конфигурация базы доработана или это поле "
@@ -270,9 +350,14 @@ def check_object(ext, kind, name, cfg_old, cfg_new):
         theirs, before = _folded(getattr(n, bucket)), _folded(getattr(old, bucket)) if old else {}
         for child, info in getattr(o, bucket).items():
             check(part, child, info, theirs, before, new_fields, old_fields, bucket in ("attrs", "dims", "res"))
-    new_ts, old_ts = _folded(n.ts), _folded(old.ts) if old else {}
+    new_ts = {k.casefold(): v for k, v in n.ts.items()}
+    old_ts = {k.casefold(): v for k, v in old.ts.items()} if old else {}
+    ts_info = lambda info: {k.casefold(): {"name": k, "uuid": info.ts_uuids.get(k, (None, None))[0]}  # noqa: E731
+                            for k in info.ts}
+    new_ts_info, old_ts_info = ts_info(n), ts_info(old) if old else {}
     for ts, cols in o.ts.items():
-        check("табличная часть", ts, {"adopted": ts in o.ts_adopted}, new_ts, old_ts, new_fields, old_fields, False)
+        check("табличная часть", ts, {"adopted": ts in o.ts_adopted, "ext_uuid": o.ts_uuids.get(ts, (None, None))[1]},
+              new_ts_info, old_ts_info, new_fields, old_fields, False)
         if ts not in o.ts_adopted or ts.casefold() not in new_ts:
             continue
         theirs, before = _folded(new_ts[ts.casefold()]), _folded(old_ts.get(ts.casefold(), {}))
@@ -285,13 +370,19 @@ def check_object(ext, kind, name, cfg_old, cfg_new):
             if child not in have:
                 removed(part, original, have)  # «Удалить<Имя>» is looked for among the vendor's forms / templates / …
             elif bucket == "forms":
-                found.extend(dict(base, **f) for f in check_form_lists(ext, kind, name, original, cfg_old, cfg_new))
+                done = []
+                found.extend(dict(base, **f) for f in check_form_lists(ext, kind, name, original, cfg_old, cfg_new,
+                                                                      done))
+                if ported is not None:
+                    ported.extend("%s.%s" % (title, x) for x in done)
     return found
 
 
-def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):
+def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None, ported=None):
+    """(extensions, findings, stats); ported - a list that gets {ext, list} of the lists already ported."""
     exts = metadata.find_extensions(ext_roots, only, skip)
     findings, stats = [], Counter()
+    ported = [] if ported is None else ported
     for ext in exts:
         for kind, (folder, _, _) in sorted(metadata.KINDS.items()):
             root = os.path.join(ext.root, folder)
@@ -301,15 +392,18 @@ def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):
                 if not f.endswith(".xml"):
                     continue
                 stats["objects"] += 1
-                res = check_object(ext, kind, f[:-4], cfg_old, cfg_new)
+                done = []
+                res = check_object(ext, kind, f[:-4], cfg_old, cfg_new, done)
+                ported.extend({"ext": ext.name, "list": x} for x in done)
                 if ext.object(kind, f[:-4]) is not None and ext.object(kind, f[:-4]).adopted:
                     stats["adopted"] += 1
                 findings.extend(res)
     stats["unreadable"] = sum(1 for f in findings if f["check"] == "XML_UNREADABLE")
+    stats["lists_ported"] = len(ported)
     return exts, findings, stats
 
 
-def render(args, exts, findings, stats, elapsed):
+def render(args, exts, findings, stats, elapsed, ported=()):
     md = ["# Заимствованные объекты расширений против нового релиза", ""]
     md.append("new: `%s`, old: `%s`. Расширений: %d, объектов в них: %d, из них заимствованных: %d. Время: %.1f с." % (
         args.config_new, args.config_old, len(exts), stats["objects"], stats["adopted"], elapsed))
@@ -325,6 +419,11 @@ def render(args, exts, findings, stats, elapsed):
     counts = Counter(f["check"] for f in findings)
     md.append(fileio.md_table(["Проверка", "Находок", "Смысл"], [(k, counts.get(k, 0), v) for k, v in EXPLAIN.items()]))
     md.append("")
+    if ported:
+        md.append("Списки, которые меняли и вендор, и расширение, но расширение уже перенесло правку вендора (в его "
+                  "запросе всё, что вендор добавил, и нет убранного, или BaseForm — список new) — не находки: " +
+                  ", ".join("%s (%s)" % (x["list"], x["ext"]) for x in ported) + ".")
+        md.append("")
     md.append("## Находки")
     md.append("")
     md.append(fileio.md_table(["Проверка", "Расширение", "Объект", "Что", "Формы расширения с этим полем"],
@@ -355,13 +454,15 @@ def main(argv=None):
     metadata.check_config(args.config_old, "--config-old")
     cfg_new = metadata.Dump(args.config_new, "new")
     cfg_old = metadata.Dump(args.config_old, "old")
-    exts, findings, stats = analyze(args.ext_root, cfg_old, cfg_new, args.ext, args.skip)
+    ported = []
+    exts, findings, stats = analyze(args.ext_root, cfg_old, cfg_new, args.ext, args.skip, ported)
     if not exts:
         sys.exit("no extension dumps found under --ext-root")
     elapsed = time.time() - t0
     data = {"config_new": args.config_new, "config_old": args.config_old, "extensions": [e.name for e in exts],
-            "stats": dict(stats), "findings": findings}
-    md_path, json_path = fileio.write_report(args.out, "borrowed", render(args, exts, findings, stats, elapsed), data)
+            "stats": dict(stats), "findings": findings, "lists_ported": ported}
+    md_path, json_path = fileio.write_report(args.out, "borrowed", render(args, exts, findings, stats, elapsed,
+                                                                          ported), data)
     counts = Counter(f["check"] for f in findings)
     print("extensions: %d, adopted objects: %d, findings: %d%s, %.1fs" % (
         len(exts), stats["adopted"], len(findings),

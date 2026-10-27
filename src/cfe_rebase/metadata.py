@@ -55,6 +55,22 @@ KINDS = {
     "ПараметрСеанса": ("SessionParameters", None, None),
 }
 FOLDER2KIND = {v[0].lower(): k for k, v in KINDS.items()}
+# RU kind -> English element name of Configuration.xml ChildObjects and of «Kind.Name» in ConfigDumpInfo.xml / types
+KIND_TAGS = {
+    "Справочник": "Catalog", "Документ": "Document", "РегистрНакопления": "AccumulationRegister",
+    "РегистрСведений": "InformationRegister", "РегистрБухгалтерии": "AccountingRegister",
+    "РегистрРасчета": "CalculationRegister", "Перечисление": "Enum",
+    "ПланВидовХарактеристик": "ChartOfCharacteristicTypes", "ПланСчетов": "ChartOfAccounts",
+    "ПланВидовРасчета": "ChartOfCalculationTypes", "ПланОбмена": "ExchangePlan", "БизнесПроцесс": "BusinessProcess",
+    "Задача": "Task", "Обработка": "DataProcessor", "Отчет": "Report", "Константа": "Constant",
+    "ЖурналДокументов": "DocumentJournal", "Последовательность": "Sequence", "КритерийОтбора": "FilterCriterion",
+    "ХранилищеНастроек": "SettingsStorage", "ОбщийМодуль": "CommonModule", "ОбщаяФорма": "CommonForm",
+    "ОбщаяКоманда": "CommonCommand", "ОбщийМакет": "CommonTemplate", "HTTPСервис": "HTTPService",
+    "WebСервис": "WebService", "РегламентноеЗадание": "ScheduledJob", "ПодпискаНаСобытие": "EventSubscription",
+    "ОпределяемыйТип": "DefinedType", "Роль": "Role", "ФункциональнаяОпция": "FunctionalOption",
+    "Подсистема": "Subsystem", "ПараметрСеанса": "SessionParameter",
+}
+TAG2KIND = {v.casefold(): k for k, v in KIND_TAGS.items()}
 COLL2KIND = {}
 for _k, _v in KINDS.items():
     if _v[1]:
@@ -186,7 +202,7 @@ def _child_names(el, tag):
             continue
         nm = props.findtext(MD + "Name")
         if nm:
-            out[nm] = {"uuid": ch.get("uuid"),
+            out[nm] = {"uuid": ch.get("uuid"), "ext_uuid": props.findtext(MD + "ExtendedConfigurationObject"),
                        "adopted": props.findtext(MD + "ObjectBelonging") == "Adopted",
                        "types": _types(props), "type_key": type_key(props),
                        # a dimension of an accumulation register: whether totals are kept by it
@@ -236,6 +252,8 @@ class ObjectInfo(object):
         self.enum_values = {}
         self.ts = {}          # name -> {columns}
         self.ts_adopted = set()
+        self.ts_uuids = {}    # tabular section name -> (own uuid, ExtendedConfigurationObject)
+        self.uuid = None      # own uuid of the object
         self.forms = []
         self.templates = []
         self.commands = []
@@ -285,6 +303,7 @@ class ObjectInfo(object):
         obj = next(iter(root), None)
         if obj is None:
             return
+        self.uuid = obj.get("uuid")
         props = obj.find(MD + "Properties")
         if props is not None:
             self.adopted = props.findtext(MD + "ObjectBelonging") == "Adopted"
@@ -317,6 +336,7 @@ class ObjectInfo(object):
             if tco is not None:
                 cols = _child_names(tco, "Attribute")
             self.ts[nm] = cols
+            self.ts_uuids[nm] = (ts.get("uuid"), props.findtext(MD + "ExtendedConfigurationObject"))
             if props.findtext(MD + "ObjectBelonging") == "Adopted":
                 self.ts_adopted.add(nm)
         self.forms = [x.text.strip() for x in co.findall(MD + "Form") if x.text]
@@ -399,6 +419,8 @@ class Dump(object):
         self._cm_props = {}
         self._files = None
         self._recorders = None
+        self._uuids = {}
+        self._counterparts = {}
 
     # -- files ---------------------------------------------------------------------------------------------------
     def path(self, rel):
@@ -456,6 +478,24 @@ class Dump(object):
                     self.unreadable.append({"kind": kind, "name": name, "path": p, "error": self._errors[key]})
             self._objects[key] = info
         return self._objects[key]
+
+    def object_uuid(self, kind, name):
+        """uuid attribute of the object XML, read from the head of the file; None when the file is absent."""
+        return head_uuid(self.object_path(kind, name)) if kind in KINDS else None
+
+    def uuid_names(self, kind):
+        """{lowercased uuid: name} of the objects of one kind, from the head of every object XML (read once per kind):
+        the vendor keeps the uuid when it renames an object."""
+        if kind not in self._uuids:
+            out = {}
+            folder = os.path.join(self.root, KINDS[kind][0]) if kind in KINDS else None
+            for f in sorted(os.listdir(folder)) if folder and os.path.isdir(folder) else []:
+                if f.lower().endswith(".xml"):
+                    uid = head_uuid(os.path.join(folder, f))
+                    if uid:
+                        out.setdefault(uid.lower(), f[:-4])
+            self._uuids[kind] = out
+        return self._uuids[kind]
 
     def object_error(self, kind, name):
         """The parser error of an object whose XML exists but does not parse; None when it is absent or read."""
@@ -543,6 +583,65 @@ class Dump(object):
 
     def __repr__(self):
         return "Dump(%s)" % self.name
+
+
+_HEAD_UUID_RE = re.compile(rb"<MetaDataObject\b[^>]*>\s*<\w+\s+uuid=\"([^\"]+)\"")
+
+
+def head_uuid(path):
+    """uuid of the object element right under MetaDataObject; the head of the file is enough (a document XML runs to
+    several MB)."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as fh:
+        m = _HEAD_UUID_RE.search(fh.read(16384))
+    return m.group(1).decode("ascii", "replace") if m else None
+
+
+def counterpart_name(src, kind, name, dump):
+    """Name in `dump` of the object (kind, name) of the extension dump `src`, or None when dump has none. The vendor
+    keeps the uuid when it renames an object: a configuration is matched by ExtendedConfigurationObject of the
+    extension's object, another dump of an extension (its work copy) by the object's own uuid, which survives the
+    rename of an adoption. Without a uuid to go by, the object of the same name."""
+    if dump is None or kind not in KINDS:
+        return None
+    key = (os.path.normcase(src.root), kind, name.casefold())
+    if key not in dump._counterparts:
+        o = src.object(kind, name)
+        uid = None
+        if o is not None:
+            uid = o.uuid if dump.is_extension else o.props.get("ExtendedConfigurationObject")
+        res = None
+        if dump.object_exists(kind, name) and (not uid or (dump.object_uuid(kind, name) or "").lower() == uid.lower()):
+            res = name
+        elif uid:
+            res = dump.uuid_names(kind).get(uid.lower())
+        if res is None and dump.object_exists(kind, name):
+            res = name
+        dump._counterparts[key] = res
+    return dump._counterparts[key]
+
+
+def counterpart_rel(src, rel, dump):
+    """(rel of the same file in `dump`, (name in src, name in dump) or None) for a file of an object of the extension
+    dump src: a renamed object (counterpart_name) moves its files to the folder of the new name."""
+    kind, name = module_owner(rel)
+    if kind is None or dump is None:
+        return rel, None
+    other = counterpart_name(src, kind, name, dump)
+    if other is None or other.casefold() == name.casefold():
+        return rel, None
+    parts = norm_rel(rel).split("/")
+    parts[1] = other
+    return "/".join(parts), (name, other)
+
+
+def renamed_note(kind, old, new):
+    """A finding's words for a vendor rename."""
+    note = "вендор переименовал %s.%s в %s (uuid тот же)" % (kind, old, new)
+    if new.casefold().startswith("удалить"):
+        note += " — пометил к удалению"
+    return note
 
 
 def find_extensions(roots, only=None, skip=None):

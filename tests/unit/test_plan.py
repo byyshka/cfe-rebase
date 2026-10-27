@@ -111,6 +111,20 @@ class Rules(unittest.TestCase):
         self.assertEqual(groups(p), {(MOD, "Р_А"): "REVIEW"})
         self.assertIn("мёртвый код", p["items"][0]["what"][-1])
 
+    def test_queries_and_registers_in_dead_methods_go_to_review(self):
+        # a real plan.md - a query broken by the update in a method only dead code calls stayed «исправить»
+        q = {"ext": "Р", "file": MOD, "part": "query", "kind": "поле", "ref": "Р.Х", "note": "", "old": "было корректно"}
+        r = {"ext": "Р", "module": MOD, "register": "РегистрСведений.А", "detail": "x", "check": "CHANGED"}
+        p = plan.build({"methods": []}, {"cases": []}, {"registry": []}, {"findings": []}, {"findings": [
+            dict(q, where="метод Р_А", method_live="вызывается только из мёртвого кода"),
+            dict(q, where="метод Р_Б", method_live="есть ссылки"),
+            dict(q, where="метод Р_В", method_live="ссылок в расширениях нет")]}, None, {"findings": [
+                dict(r, method="Р_Г", method_live="ссылок в расширениях нет"),
+                dict(r, method="Р_Д", method_live="событие платформы")]})
+        self.assertEqual(groups(p), {(MOD, "Р_А"): "REVIEW", (MOD, "Р_Б"): "MUST_FIX", (MOD, "Р_В"): "REVIEW",
+                                     (MOD, "Р_Г"): "REVIEW", (MOD, "Р_Д"): "MUST_FIX"})
+        self.assertTrue(all("мёртвый код" in x["what"][-1] for x in p["items"] if x["group"] == "REVIEW"))
+
     def test_render_and_screen(self):
         p = build(ctl=[{"ext": "Р", "module": MOD, "module_title": "ОбщийМодуль.М", "ext_method": "Р_А",
                         "verdict": "REBASED"}])
@@ -120,6 +134,42 @@ class Rules(unittest.TestCase):
         lines = plan.screen_lines(p)
         self.assertEqual(lines[0], "план: исправить 1, проверить 0, уточнить 0; скрыто: 0")
         self.assertIn(plan.NOT_COVERED, lines[-1])
+
+
+class Liveness(unittest.TestCase):
+    """refs.Refs.liveness: a method referenced only from methods nothing live calls is dead too."""
+
+    def test_transitive(self):
+        import os
+        import shutil
+        import tempfile
+        from cfe_rebase import metadata, refs
+        tmp = tempfile.mkdtemp(prefix="cfe_refs_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        files = {
+            "Configuration.xml": "<MetaDataObject><Configuration><Properties><Name>Р</Name></Properties>"
+                                 "</Configuration></MetaDataObject>",
+            "CommonModules/М/Ext/Module.bsl": "\n".join([
+                "Функция Нижний() Экспорт", "\tВозврат 1;", "КонецФункции", "",
+                "Функция Средний()", "\tВозврат Нижний();", "КонецФункции", "",
+                "// Средний();", "Процедура Мёртвый()", "\tСредний();", "КонецПроцедуры", "",
+                "Функция Сам() Экспорт", "\tВозврат Нижний2();", "КонецФункции", "",
+                "Функция Нижний2()", "\tВозврат 2;", "КонецФункции"]),
+            "Documents/Д/Ext/ObjectModule.bsl": "\n".join([
+                "Процедура ПередЗаписью(Отказ)", "\tМ.Сам();", "КонецПроцедуры"]),
+        }
+        for rel, text in files.items():
+            path = os.path.join(tmp, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        ext = metadata.Dump(tmp)
+        index = refs.build([ext], refs.form_cache())
+        mod = ext.module("CommonModules/М/Ext/Module.bsl")
+        live = {m.name: index.liveness("CommonModules/М/Ext/Module.bsl", m) for m in mod.methods}
+        self.assertEqual(live, {"Нижний": refs.DEAD_CALLERS, "Средний": refs.DEAD_CALLERS,
+                                "Мёртвый": "ссылок в расширениях нет", "Сам": "есть ссылки",
+                                "Нижний2": "есть ссылки"})
 
 
 if __name__ == "__main__":

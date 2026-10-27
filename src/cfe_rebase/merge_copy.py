@@ -9,6 +9,12 @@ author edit and collide with every vendor change around it. Everything else of t
 Output goes to --out only: the merged body (conflicts in diff3 style, BOM and line endings of the copy module)
 and a report with the reverse-diff control of 4.4 step 4. The extension dump is never written. The merge does
 not replace the line classes of 4.2 (1 / 1a / 2) or the vendor migration path of 4.3.
+
+Refused: a copy that calls ПродолжитьВызов - a wrapper, not a copy (the vendor change runs through the call; bodies
+excludes such methods too). Flags of the report: AUTHOR_BLOCK_MOVED - an author line sits under other conditions in the
+result than in the copy (the vendor rebuilt the Если chain around it: a real copy merged with 0 conflicts into the branch
+the 2026 documents never reach); BODY_EXTRACTED - the vendor moved the body out (new is 75 % shorter and calls a method
+the old body does not, a real case), port the author's edit onto the new body instead of merging.
 """
 import argparse
 import difflib
@@ -341,17 +347,37 @@ def conflict_diffs(merged):
     return out
 
 
+STRUCTURAL = {x.casefold() for x in """
+Иначе Else КонецЕсли EndIf КонецЦикла EndDo КонецПопытки EndTry Исключение Except Попытка Try Тогда Then Цикл Do
+Возврат Return Продолжить Continue Прервать Break КонецПроцедуры EndProcedure КонецФункции EndFunction
+ВЫБРАТЬ SELECT ИНАЧЕ КОГДА WHEN ТОГДА КОНЕЦ END ИЗ FROM ГДЕ WHERE И AND ИЛИ OR НЕ NOT ПО ON ОБЪЕДИНИТЬ UNION ВСЕ ALL
+СГРУППИРОВАТЬ УПОРЯДОЧИТЬ BY ВЫБОР CASE РАЗРЕШЕННЫЕ ALLOWED РАЗЛИЧНЫЕ DISTINCT ЛЕВОЕ ПРАВОЕ ПОЛНОЕ ВНУТРЕННЕЕ
+СОЕДИНЕНИЕ JOIN LEFT RIGHT FULL INNER ИМЕЮЩИЕ HAVING ИТОГИ TOTALS ПОМЕСТИТЬ INTO УНИЧТОЖИТЬ DROP
+""".split()}
+
+
+def structural(line):
+    """A line of keywords and punctuation only (`Иначе`, `КонецЕсли;`, `|`, `|ВЫБРАТЬ`, `|ИЗ`): a duplicate of it says
+    nothing by itself - 9 of 18 port_replace reports of a real run with duplicates had only such lines, one was a real
+    break (caught by AUTHOR_BLOCK_MOVED)."""
+    words = re.findall(r"[\wЁё]+", _norm(line))
+    return all(w.casefold() in STRUCTURAL for w in words)
+
+
 def control(old, new, copy, merged):
     """Reverse diff of 4.4 step 4. left_new - lines of the new body missing from the result; the ones found in old
     are old text the author replaced, the rest (dropped_vendor_new) is new vendor code the merge threw away and
-    must be zero. added_to_new - author lines and conflict markers. lost - see lost_lines()."""
+    must be zero. added_to_new - author lines and conflict markers. lost - see lost_lines(). duplicated - lines that
+    would repeat (see duplicated()) except keywords-only ones, which go to duplicated_structural."""
     old_norm = {_norm(s) for s in old}
     left = [s for s in _removed(new, merged) if _norm(s)]
+    dup = duplicated(new, copy, merged)
     return {"left_new": left,
             "dropped_vendor_new": [s for s in left if _norm(s) not in old_norm],
             "added_to_new": [s for s in _removed(merged, new) if _norm(s)],
             "lost": lost_lines(old, copy, merged),
-            "duplicated": duplicated(new, copy, merged)}
+            "duplicated": {k: [s for s in v if not structural(s)] for k, v in dup.items()},
+            "duplicated_structural": {k: [s for s in v if structural(s)] for k, v in dup.items()}}
 
 
 def _method(path, name, what):
@@ -377,6 +403,121 @@ def _copy_method(path, target, name):
     return m, mod.lines[m.decl_line - 1:m.end_line]
 
 
+# Statements that open, switch and close blocks; the path of a line is the chain of blocks it sits in.
+BLOCK_RE = re.compile(r"(?<![\wЁё.])(Если|If|ИначеЕсли|ElsIf|Иначе|Else|КонецЕсли|EndIf|Для|For|Пока|While|"
+                      r"КонецЦикла|EndDo|Попытка|Try|Исключение|Except|КонецПопытки|EndTry)(?![\wЁё])", re.IGNORECASE)
+BLOCK_OPEN = {"если", "if", "для", "for", "пока", "while", "попытка", "try"}
+BLOCK_SWITCH = {"иначеесли", "elsif", "иначе", "else", "исключение", "except"}
+BLOCK_CLOSE = {"конецесли", "endif", "конеццикла", "enddo", "конецпопытки", "endtry"}
+
+
+def block_paths(lines):
+    """Per line: the chain of blocks it sits in at its start - ((opening header, current branch header), ...), headers
+    as written up to Тогда / Цикл, whitespace collapsed. Comments and string contents are not code."""
+    out, stack = [], []
+    for t in bsl.lex_lines(lines):
+        out.append(tuple(stack))
+        if t.kind != "code":
+            continue
+        code = t.blank
+        for m in BLOCK_RE.finditer(code):
+            kw = m.group(1).casefold()
+            head = _norm(re.split(r"(?<![\wЁё])(?:Тогда|Then|Цикл|Do)(?![\wЁё])", code[m.start():], 1,
+                                  flags=re.IGNORECASE)[0])
+            if kw in BLOCK_OPEN:
+                stack.append((head, head))
+            elif kw in BLOCK_SWITCH and stack:
+                stack[-1] = (stack[-1][0], head)
+            elif kw in BLOCK_CLOSE and stack:
+                stack.pop()
+    return out
+
+
+def _with_copy_side(merged):
+    """[(index in merged, line)] of the merged text read with every conflict resolved to the copy."""
+    out, state = [], None
+    for k, s in enumerate(merged):
+        if s.startswith("<<<<<<<"):
+            state = "new"
+        elif s.startswith("|||||||") and state:
+            state = "old"
+        elif s.startswith("=======") and state:
+            state = "copy"
+        elif s.startswith(">>>>>>>") and state:
+            state = None
+        elif state is None or state == "copy":
+            out.append((k, s))
+    return out
+
+
+def author_moved(old, copy, merged, copy_start=1):
+    """AUTHOR_BLOCK_MOVED: author blocks (copy lines that are not in old) whose chain of enclosing blocks differs between
+    the copy and the merged text - the vendor rebuilt the conditions around them, and the block may now run in another
+    case than the author meant. A conflict is read on the copy side. Moved author lines at most BLOCK_GAP apart make one
+    block. [{'copy_line', 'copy_end' (in the copy module: copy_start is the line of the copy's first line),
+    'merged_line' (1-based in the merged file), 'lines' (moved author lines in the block), 'text' (its first line),
+    'copy_path', 'merged_path' (of the first line: opening header, or opening header -> branch header)}]."""
+    side = _with_copy_side(merged)
+    author = set()
+    sm = difflib.SequenceMatcher(None, [_norm(x) for x in old], [_norm(x) for x in copy], autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("insert", "replace"):
+            author.update(j for j in range(j1, j2) if _norm(copy[j]))
+    if not author:
+        return []
+    p_copy, p_side = block_paths(copy), block_paths([x for _, x in side])
+    sm = difflib.SequenceMatcher(None, [_norm(x) for x in copy], [_norm(x) for _, x in side], autojunk=False)
+    moved = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for j, k in zip(range(i1, i2), range(j1, j2)):
+            if j not in author or p_copy[j] == p_side[k]:
+                continue
+            last = moved[-1] if moved else None
+            if last and j - last["_j"] <= BLOCK_GAP:  # one author block: vendor lines inside it do not split it
+                last["lines"] += 1
+                last["_j"] = j
+                last["copy_end"] = copy_start + j
+                continue
+            moved.append({"copy_line": copy_start + j, "copy_end": copy_start + j, "merged_line": side[k][0] + 1,
+                          "lines": 1, "text": copy[j].strip(), "copy_path": _shown(p_copy[j]),
+                          "merged_path": _shown(p_side[k]), "_j": j})
+    for b in moved:
+        del b["_j"]
+    return moved
+
+
+BLOCK_GAP = 3
+
+
+def _shown(path):
+    return [a if a == b else "%s -> %s" % (a, b) for a, b in path]
+
+
+EXTRACT_SHARE = 0.25
+
+
+def body_extracted(old_mod, m_old, new_mod, m_new):
+    """BODY_EXTRACTED: the new body is at most EXTRACT_SHARE of the old one (code lines after the parameter list) and
+    calls a method the old body does not - the vendor moved the body out (a real case: 411 lines -> 41 and a new
+    …ШапкиТЧ). Merging then drags the whole old body into the result. {'old_lines', 'new_lines', 'new_calls'} or None."""
+    o = [t for k, t in bsl.body_code(old_mod, m_old) if k > m_old.decl_end_line]
+    n = [t for k, t in bsl.body_code(new_mod, m_new) if k > m_new.decl_end_line]
+    if not o or len(n) > len(o) * EXTRACT_SHARE:
+        return None
+    before = {c["name"].casefold() for c in old_mod.calls() if c["method"] is m_old}
+    added = sorted({c["name"] for c in new_mod.calls() if c["method"] is m_new and c["name"].casefold() not in before
+                    and c["name"].casefold() not in bsl.KEYWORDS}, key=str.casefold)
+    if not added:
+        return None
+    return {"old_lines": len(o), "new_lines": len(n), "new_calls": added}
+
+
+EXTRACT_ADVICE = ("вендор вынес тело метода: не сливать, а перенести правку автора на тело new (слияние тянет в "
+                  "результат всё тело old)")
+
+
 def _dump_root(path):
     """Nearest parent directory with Configuration.xml, or None."""
     d = os.path.dirname(os.path.abspath(path))
@@ -394,7 +535,8 @@ def _inside(path, root):
     return path == root or path.startswith(root.rstrip("\\/") + os.sep)
 
 
-def render(args, copy_name, res, ctl):
+def render(args, copy_name, res, ctl, extra=None):
+    extra = extra or {}
     md = ["# Перенос копии `&Вместо` трёхсторонним слиянием", ""]
     md.append("Метод `%s`, копия `%s`. old: `%s`, new: `%s`, копия: `%s`." % (
         args.method, copy_name, args.old, args.new, args.copy))
@@ -413,10 +555,34 @@ def render(args, copy_name, res, ctl):
     md.append("| Строк копии нет ни в результате, ни в old (возможная потеря работы автора) | %d |" % len(ctl["lost"]))
     md.append("| Строк задвоится, если все конфликты решить в пользу new / копии (должно быть 0) | %d / %d |"
               % (len(ctl["duplicated"]["new"]), len(ctl["duplicated"]["copy"])))
+    md.append("| Из задвоенных — только ключевые слова (`Иначе`, `КонецЕсли;`, пустая строка запроса), сами по себе не поломка | %d / %d |"
+              % (len(ctl["duplicated_structural"]["new"]), len(ctl["duplicated_structural"]["copy"])))
+    moved = extra.get("author_moved") or []
+    extracted = extra.get("body_extracted")
+    md.append("| Блоков автора под другими условиями, чем в копии (AUTHOR_BLOCK_MOVED, должно быть 0) | %d |" % len(moved))
+    if extracted:
+        md.append("")
+        md.append("**BODY_EXTRACTED** — %s: в теле old %d строк кода, в new %d, new вызывает то, чего нет в old: %s." % (
+            EXTRACT_ADVICE, extracted["old_lines"], extracted["new_lines"],
+            ", ".join("`%s`" % x for x in extracted["new_calls"])))
+    if moved:
+        md.append("")
+        md.append("## AUTHOR_BLOCK_MOVED: блок автора под другими условиями")
+        md.append("")
+        md.append("Вендор перестроил условия вокруг блока: слияние без конфликта могло поставить его в ветку, которая "
+                  "выполняется в другом случае. Сверить по смыслу.")
+        for b in moved:
+            md.append("")
+            md.append("- копия:%d–%d → результат:%d (строк автора %d) `%s`" % (
+                b["copy_line"], b["copy_end"], b["merged_line"], b["lines"], b["text"].replace("`", "'")))
+            md.append("  - в копии: %s" % (" / ".join("`%s`" % x for x in b["copy_path"]) or "вне блоков"))
+            md.append("  - в результате: %s" % (" / ".join("`%s`" % x for x in b["merged_path"]) or "вне блоков"))
     sections = [("Выпал новый код вендора", ctl["dropped_vendor_new"]),
                 ("Возможно потеряны (строки автора)", ctl["lost"]),
                 ("Задвоится при выборе стороны new", ctl["duplicated"]["new"]),
                 ("Задвоится при выборе стороны копии", ctl["duplicated"]["copy"]),
+                ("Задвоятся только ключевые слова (new / копия)",
+                 ctl["duplicated_structural"]["new"] + ctl["duplicated_structural"]["copy"]),
                 ("Ушли из тела new", ctl["left_new"])]
     for title, items in sections:
         md.append("")
@@ -464,25 +630,37 @@ def main(argv=None):
     root = _dump_root(args.copy)
     if root and _inside(args.out, root):
         sys.exit("--out %s is inside the extension dump %s: merge_copy never writes there" % (args.out, root))
-    _, _, old = _method(args.old, args.method, "old")
-    _, _, new = _method(args.new, args.method, "new")
+    old_mod, m_old, old = _method(args.old, args.method, "old")
+    new_mod, m_new, new = _method(args.new, args.method, "new")
     m, copy = _copy_method(args.copy, args.method, args.copy_method)
+    if m.has_proceed:
+        sys.exit("%s calls ПродолжитьВызов: a wrapper, not a frozen copy - the vendor body runs through the call, "
+                 "there is nothing to merge (check only the signature and the directive: interceptors / "
+                 "list_interceptors)" % m.name)
     res = merge_bodies(old, new, copy, auto=True)
     ctl = control(old, new, copy, res["lines"])
+    extra = {"author_moved": author_moved(old, copy, res["lines"], m.decl_line),
+             "body_extracted": body_extracted(old_mod, m_old, new_mod, m_new)}
+    flags = [f for f, on in (("AUTHOR_BLOCK_MOVED", extra["author_moved"]),
+                             ("BODY_EXTRACTED", extra["body_extracted"])) if on]
 
     name = "merge_copy_" + re.sub(r"[^\w.-]", "_", m.name)
     body_path = os.path.join(args.out, name + ".bsl")
     os.makedirs(args.out, exist_ok=True)
     fileio.write_like(body_path, "\n".join(res["lines"]) + "\n", args.copy)
-    md_path, json_path = fileio.write_report(args.out, name, render(args, m.name, res, ctl), {
+    md_path, json_path = fileio.write_report(args.out, name, render(args, m.name, res, ctl, extra), {
         "method": args.method, "copy_method": m.name, "old": args.old, "new": args.new, "copy": args.copy,
-        "conflicts": res["conflicts"], "auto_resolved": res["auto"], "conflict_kinds": res["kinds"],
-        "control": ctl})
+        "copy_lines": [m.decl_line, m.end_line], "flags": flags, "conflicts": res["conflicts"],
+        "auto_resolved": res["auto"], "conflict_kinds": res["kinds"], "control": ctl,
+        "author_moved": extra["author_moved"], "body_extracted": extra["body_extracted"],
+        "advice": EXTRACT_ADVICE if extra["body_extracted"] else None})
     print("conflicts: %d (resolved by whitespace rules: %d, same-point insertions: %d), left new: %d (vendor-new "
           "dropped: %d), added: %d, possibly lost: %d, duplicated new/copy: %d/%d" % (
               res["conflicts"], len(res["auto"]), sum(1 for k in res["kinds"] if k["kind"] == "same_point"),
               len(ctl["left_new"]), len(ctl["dropped_vendor_new"]), len(ctl["added_to_new"]),
               len(ctl["lost"]), len(ctl["duplicated"]["new"]), len(ctl["duplicated"]["copy"])))
+    if flags:
+        print("flags: " + ", ".join(flags))
     for p in (body_path, md_path, json_path):
         print(p)
 

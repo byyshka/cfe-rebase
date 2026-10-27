@@ -186,6 +186,18 @@ MODULE2 = '''Функция Данные2() Экспорт
 КонецПроцедуры
 '''
 
+MODULE3 = '''Процедура Предопределенные(Товар) Экспорт
+	Открыт = ПредопределенноеЗначение("Перечисление.Статусы.Открыт");
+	Удален = PredefinedValue("Перечисление.Статусы.Удален");
+	Запрос = Новый Запрос;
+	Запрос.Текст =
+	"ВЫБРАТЬ
+	|	Т.Ссылка КАК Ссылка
+	|ИЗ
+	|	Справочник.Товары КАК Т";
+КонецПроцедуры
+'''
+
 DCS = '''<?xml version="1.0" encoding="UTF-8"?>
 <DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema"
 		xmlns:dcsset="http://v8.1c.ru/8.1/data-composition-system/settings"
@@ -230,7 +242,7 @@ class QueriesTest(unittest.TestCase):
             fh.write("%s<Form><Properties><ObjectBelonging>Adopted</ObjectBelonging><Name>СтараяФорма</Name>"
                      "</Properties></Form></MetaDataObject>" % HEAD)
         obj(ext, "Enums", "Enum", "Статусы", child("EnumValue", "Архивный", adopted=True), adopted=True)
-        for name, text in (("М", MODULE), ("М2", MODULE2)):
+        for name, text in (("М", MODULE), ("М2", MODULE2), ("М3", MODULE3)):
             mod = os.path.join(ext, "CommonModules", name, "Ext")
             os.makedirs(mod)
             with open(os.path.join(mod, "Module.bsl"), "w", encoding="utf-8-sig") as fh:
@@ -278,6 +290,18 @@ class QueriesTest(unittest.TestCase):
     def test_literals(self):
         self.assertEqual(self.by_ref["СправочникСсылка.Удаленный"]["part"], "literal")
         self.assertNotIn("Перечисления.Статусы.Открыт", self.by_ref)
+
+    def test_predefined_value_is_not_query_text(self):
+        # a real case: ПредопределенноеЗначение("Вид.X.Y") in a method with a query read as the table «Вид.X.Y»
+        for ref in ("Перечисление.Статусы.Открыт", "Перечисление.Статусы.Удален"):
+            self.assertFalse([f for f in self.sw.findings if f["part"] == "query" and f["ref"] == ref], ref)
+        f = self.by_ref["Перечисление.Статусы.Удален"]  # the value itself is still checked, as a literal
+        self.assertEqual((f["part"], f["kind"], f["where"], f["line"]), ("literal", "значение",
+                                                                         "метод Предопределенные", 3))
+
+    def test_literal_findings_name_their_method(self):
+        self.assertEqual(self.by_ref["СправочникСсылка.Удаленный"]["where"], "метод Данные")
+        self.assertEqual(self.by_ref['РольДоступна("Удаленная")']["where"], "метод Сообщение")
 
     def test_bind_aliases_skips_value_and_type(self):
         q = "ВЫБРАТЬ ЗНАЧЕНИЕ(Перечисление.Статусы.Открыт), ТИП(Справочник.Цвета) ИЗ Справочник.Товары КАК Т"

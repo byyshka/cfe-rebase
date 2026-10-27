@@ -4,8 +4,9 @@ of the old and the new configuration release.
 
 For each copy: line ranges of the copy, base old and base new; line diffs old->copy (author edits and older
 drift), old->new (what the vendor changed), copy->new (what porting has to reconcile); similarity ratios
-copy~old, copy~new, old~new; a basis hint (rebased on new / old plus edits / older than old or rewritten);
-the vendor hunks old->new classified against the copy (is the vendor change already in the copy or not).
+copy~old, copy~new, old~new; the vendor hunks old->new classified against the copy (is the vendor change already in
+the copy or not: in_copy); the basis read from them - every vendor hunk in the copy: rebased on new; some: mixed; none:
+old plus edits or older than old (the share of old lines the copy dropped); no hunk decides either way: by the ratios.
 Lines are compared with whitespace collapsed and empty lines dropped; --code-only also drops comments.
 """
 import argparse
@@ -17,8 +18,10 @@ from collections import Counter
 from . import bsl, fileio, metadata
 from .control_rebase import refuse_out_inside
 
-BASIS = {"new": "перенесена на new", "old": "копия old + правки", "older": "старше old или переписана",
-         "same-old": "= old", "same-new": "= new"}
+BASIS = {"new": "перенесена на new", "mixed": "частично перенесена", "old": "копия old + правки",
+         "older": "старше old или переписана", "same-old": "= old", "same-new": "= new"}
+# the copy is ready for the new release: it is the new body, or every vendor change is in it
+PORTED = ("new", "same-new")
 
 
 def body(module, method, code_only):
@@ -33,14 +36,22 @@ def body(module, method, code_only):
     return out
 
 
-def three_way(old, copy, new):
-    """Vendor hunks old->new classified against the copy."""
-    sm_v = bsl._matcher(old, new)
-    sm_c = bsl._matcher(old, copy)
-    kept = set()
-    for tag, i1, i2, j1, j2 in sm_c.get_opcodes():
+def _kept(a, b):
+    """Indexes of a that an alignment a -> b matches."""
+    out = set()
+    for tag, i1, i2, _, _ in bsl._matcher(a, b).get_opcodes():
         if tag == "equal":
-            kept.update(range(i1, i2))
+            out.update(range(i1, i2))
+    return out
+
+
+def three_way(old, copy, new):
+    """Vendor hunks old->new classified against the copy; in_copy - the copy carries the hunk: its new lines are
+    matched by the alignment new -> copy (not merely present somewhere: a lone «|» of a query always is) and its old
+    lines by none of old -> copy, or it is a vendor move the copy follows."""
+    sm_v = bsl._matcher(old, new)
+    kept = _kept(old, copy)
+    new_kept = _kept(new, copy)
     copy_texts = {t for _, t in copy}
     res = []
     for tag, i1, i2, j1, j2 in sm_v.get_opcodes():
@@ -59,10 +70,14 @@ def three_way(old, copy, new):
             else:
                 cls = "частично: часть строк old в копии"
         else:
-            cls = "вставка new уже есть в копии" if new_part and new_in_copy == len(new_part) else \
+            cls = "вставка new уже есть в копии" if new_part and all(j in new_kept for j in range(j1, j2)) else \
                 "ДРЕЙФ: вставки new нет в копии"
         res.append({"class": cls, "old": old[i1:i2], "new": new_part, "span": (i1, i2, j1, j2)})
-    mark_moves(res, old, copy, new, kept)
+    mark_moves(res, old, copy, new, kept, new_kept)
+    for h in res:
+        i1, i2, j1, j2 = h["span"]
+        h["in_copy"] = h["class"] == MOVE_CARRIED or (not h["class"].startswith("ДРЕЙФ") and all(
+            j in new_kept for j in range(j1, j2)) and not any(i in kept for i in range(i1, i2)))
     return res
 
 
@@ -71,7 +86,7 @@ MOVE_CARRIED = "перемещение вендора: в копии поряд�
 MOVE_DRIFT = "ДРЕЙФ: перемещение вендора не перенесено, в копии порядок old"
 
 
-def mark_moves(hunks, old, copy, new, kept):
+def mark_moves(hunks, old, copy, new, kept, new_kept=None):
     """A vendor move is a pure delete and a pure insert of the same lines. The two alignments (old->new and
     old->copy) resolve it independently, so a copy already rebased on new reads exactly like a stale one.
     The copy is judged by the order it keeps: an alignment preserves order, so the moved lines together with the
@@ -81,7 +96,6 @@ def mark_moves(hunks, old, copy, new, kept):
     Only blocks with a line that occurs once in old and once in new count: a lone КонецЕсли; proves nothing."""
     old_count = Counter(t for _, t in old)
     new_count = Counter(t for _, t in new)
-    new_kept = None
     paired = set()
     for d in hunks:
         if d["new"] or not d["old"]:
@@ -118,14 +132,24 @@ def mark_moves(hunks, old, copy, new, kept):
             ins["class"] += MOVE_HINT
 
 
-def basis(s_co, s_cn, s_on, len_old):
+def basis(s_co, s_cn, s_on, len_old, tw=None):
+    """same-old / same-new; by the vendor hunks when they decide: all in the copy - new, some in it and some drift -
+    mixed, none in it and some drift - old or older; else (no hunks, or only places the author rewrote too) by the
+    ratios. A bare ratio misread a real copy: the copy holds the one vendor line plus 16 author lines, so copy~old 0.971 and
+    copy~new 0.973 differ by less than the 0.01 margin and the ported copy read as «old»."""
     if s_co["hunks"] == 0:
         return "same-old"
     if s_cn["hunks"] == 0:
         return "same-new"
-    if s_cn["ratio"] > s_co["ratio"] + 0.01:
-        return "new"
+    carried = sum(1 for h in tw or [] if h["in_copy"])
+    drift = sum(1 for h in tw or [] if h["class"].startswith("ДРЕЙФ"))
     removed_share = s_co["removed"] / float(len_old or 1)
+    if carried and not drift:
+        return "new"
+    if carried and drift:
+        return "mixed"
+    if not drift and s_cn["ratio"] > s_co["ratio"] + 0.01:
+        return "new"
     return "older" if removed_share > 0.05 else "old"
 
 
@@ -163,7 +187,9 @@ def analyze(args):
                 for kind, target, ann_line in m.interceptors:
                     if kind != "Вместо" or m.has_proceed:
                         continue
-                    new_mod, old_mod = cfg_new.module(rel), cfg_old.module(rel)
+                    # a vendor rename keeps the uuid: the module of a renamed object is under its name in each release
+                    new_mod = cfg_new.module(metadata.counterpart_rel(ext, rel, cfg_new)[0])
+                    old_mod = cfg_old.module(metadata.counterpart_rel(ext, rel, cfg_old)[0])
                     t_new = new_mod.find(target) if new_mod else None
                     t_old = old_mod.find(target) if old_mod else None
                     case = {"ext": ext.name, "module": rel, "module_title": metadata.module_title(rel),
@@ -187,8 +213,8 @@ def analyze(args):
                         "ratio": {"copy~old": s_co["ratio"], "copy~new": s_cn["ratio"], "old~new": s_on["ratio"]},
                         "change": {"old->copy": bsl.change_label(s_co), "old->new": bsl.change_label(s_on),
                                    "copy->new": bsl.change_label(bsl.diff_stats(c[1:], n[1:]))},
-                        "basis": basis(s_co, s_cn, s_on, len(o) - 1),
-                        "vendor_hunks": len(tw),
+                        "basis": basis(s_co, s_cn, s_on, len(o) - 1, tw),
+                        "vendor_hunks": len(tw), "vendor_in_copy": sum(1 for h in tw if h["in_copy"]),
                         "drift_hunks": sum(1 for h in tw if h["class"].startswith("ДРЕЙФ")),
                         "diff_old_copy": bsl.diff_hunks(o, c), "diff_old_new": bsl.diff_hunks(o, n),
                         "diff_copy_new": bsl.diff_hunks(c, n), "three_way": tw})
@@ -203,11 +229,14 @@ def render(cfg_new, cfg_old, exts, cases, args, elapsed):
         "только код (без комментариев)" if args.code_only else "строки с комментариями, пробелы схлопнуты",
         elapsed))
     md.append("")
-    md.append("Основа копии (`basis`): **перенесена на new** — copy~new выше copy~old; **копия old + правки** — из old "
-              "удалено не больше 5 % строк; **старше old или переписана** — удалено больше: копия снята с более "
-              "раннего релиза, либо автор переписал тело (эвристика, различить их по трём версиям нельзя). "
-              "Коэффициенты и основа считаются по телу без строки объявления (у копии всегда другое имя), "
-              "диффы — с ней. ДРЕЙФ — изменения вендора old→new, которых нет в копии.")
+    md.append("Основа копии (`basis`) — по изменениям вендора old→new: **перенесена на new** — все они в копии "
+              "(строки new стоят в копии на своих местах, строк old, которые вендор убрал, нет); **частично "
+              "перенесена** — часть в копии, часть ДРЕЙФ; **копия old + правки** — ни одного, из old удалено не больше "
+              "5 % строк; **старше old или переписана** — удалено больше: копия снята с более раннего релиза, либо "
+              "автор переписал тело (эвристика, различить их по трём версиям нельзя). Если изменения вендора не решают "
+              "(их нет или автор переписал те же места) — по коэффициентам: copy~new выше copy~old больше чем на 0,01 — "
+              "перенесена на new. Коэффициенты и основа считаются по телу без строки объявления (у копии всегда другое "
+              "имя), диффы — с ней. ДРЕЙФ — изменения вендора old→new, которых нет в копии.")
     md.append("")
     md.append(fileio.md_table(
         ["Расширение", "Модуль", "Цель", "Копия / old / new (строки)", "copy~old", "copy~new", "old~new",

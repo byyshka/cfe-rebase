@@ -12,12 +12,18 @@ Flags (registry):
                       (OVERRIDDEN? - the winner depends on the connection order, pass --order)
   DIRECTIVE_MISMATCH  compile directive of the interceptor differs from the base method (form modules)
   MISSING_BASE        base module/method/form element is absent in the new release
+  TARGET_RENAMED      the vendor renamed the object of the module (same uuid): the interceptor is checked against the
+                      module under the new name (and the old one under the old name), the adoption is to be renamed
   NEW_BASE            the base method did not exist in the old release: the interceptor now acts on new vendor logic
   SIGNATURE_CHANGED   base method signature differs between old and new
   SIGNATURE_MISMATCH  interceptor parameters (count, Знач, kind) do not match the new base method
   CONTROL_MISMATCH    &ИзменениеИКонтроль: reconstructed original text differs from the new base body
   BINDING_CHANGED     the vendor re-bound the form event (callType target or handler of an intercepted method)
   DEAD_BINDING        Form.xml binds a handler that the extension form module does not have
+  TARGET_DEPRECATED   the vendor marks the base method obsolete in new (region УстаревшиеПроцедурыИФункции or a header
+                      comment «Устарела»); [риск] when it became obsolete only in new, [инфо] when old marked it too
+  TARGET_UNCALLED     an obsolete base method the vendor code called in old and no longer calls in new: the interceptor
+                      stays bound, but nothing runs it (counted by text over the vendor modules, obsolete targets only)
 Dead code (separate section):
   UNBOUND             handler-like method (…Перед/…После/…Вместо, event names) with no annotation, no Form.xml or
                       XML binding and no call or string reference anywhere in the extensions
@@ -40,16 +46,21 @@ EXPLAIN = OrderedDict([
     ("OVERRIDDEN?", "то же, но кто выше — зависит от порядка подключения (передать `--order`)"),
     ("DIRECTIVE_MISMATCH", "директива компиляции перехватчика ≠ директиве базового метода"),
     ("MISSING_BASE", "в новой конфигурации нет базового модуля, метода или элемента формы"),
+    ("TARGET_RENAMED", "вендор переименовал объект перехваченного модуля (uuid тот же): перехват сверен с модулем нового "
+                       "имени, заимствование переименовать"),
     ("NEW_BASE", "базового метода не было в old, он появился в new: перехват теперь меняет новую типовую логику"),
     ("SIGNATURE_CHANGED", "сигнатура базового метода old ≠ new"),
     ("SIGNATURE_MISMATCH", "параметры перехватчика не совпадают с базовым методом new (число, Знач, вид)"),
     ("CONTROL_MISMATCH", "`&ИзменениеИКонтроль`: восстановленный исходный текст ≠ тело base new"),
     ("BINDING_CHANGED", "вендор перепривязал событие формы"),
     ("DEAD_BINDING", "в Form.xml назначен обработчик, которого нет в модуле формы расширения"),
+    ("TARGET_DEPRECATED", "вендор пометил базовый метод устаревшим в new (область УстаревшиеПроцедурыИФункции или "
+                          "комментарий «Устарела»)"),
+    ("TARGET_UNCALLED", "устаревший базовый метод: в old код вендора его вызывал, в new — нет; перехват молча мёртв"),
 ])
 SEVERITY = {"CONFLICT": 1, "OVERRIDDEN": 1, "DEAD_BINDING": 2, "MISSING_BASE": 2, "NEW_BASE": 2, "SIGNATURE_MISMATCH": 1,
             "CONTROL_MISMATCH": 1, "DIRECTIVE_MISMATCH": 2, "OVERRIDDEN?": 2, "SIGNATURE_CHANGED": 3,
-            "BINDING_CHANGED": 3}
+            "BINDING_CHANGED": 3, "TARGET_RENAMED": 2, "TARGET_UNCALLED": 1, "TARGET_DEPRECATED": 2}
 
 HANDLER_SUFFIX_RE = re.compile(r"(Перед|После|Вместо)$", re.IGNORECASE)
 ITEM_EVENTS = [x for x in """
@@ -141,8 +152,16 @@ def check_row(ctx, r):
     notes = []
     m = r["_m"]
     mk = r["mkind"]
-    new_mod = ctx.cfg_new.module(r["module"])
-    old_mod = ctx.cfg_old.module(r["module"]) if ctx.cfg_old else None
+    # a vendor rename keeps the uuid: the module of the renamed object is looked up under its name in each release
+    rel_new, renamed = metadata.counterpart_rel(r["_ext"], r["module"], ctx.cfg_new)
+    rel_old = metadata.counterpart_rel(r["_ext"], r["module"], ctx.cfg_old)[0] if ctx.cfg_old else r["module"]
+    if renamed and ctx.cfg_new.exists(rel_new):
+        kind, _ = metadata.module_owner(r["module"])
+        flags.append("TARGET_RENAMED")
+        notes.append(metadata.renamed_note(kind, renamed[0], renamed[1]) +
+                     ": переименовать заимствование (borrow-edit --rename), перехват сверен с модулем нового имени")
+    new_mod = ctx.cfg_new.module(rel_new)
+    old_mod = ctx.cfg_old.module(rel_old) if ctx.cfg_old else None
     t_new = t_old = None
     if r["source"] == "annotation":
         t_new = new_mod.find(r["target"]) if new_mod else None
@@ -165,8 +184,9 @@ def check_row(ctx, r):
     else:
         if r["own_element"]:
             notes.append("собственный элемент расширения — не перехват")
-        f_new = ctx.form(ctx.cfg_new, r["form"])
-        f_old = ctx.form(ctx.cfg_old, r["form"]) if ctx.cfg_old else None
+        f_new = ctx.form(ctx.cfg_new, metadata.counterpart_rel(r["_ext"], r["form"], ctx.cfg_new)[0])
+        f_old = ctx.form(ctx.cfg_old, metadata.counterpart_rel(r["_ext"], r["form"], ctx.cfg_old)[0]) \
+            if ctx.cfg_old else None
         own_new, h_new = forms.handler_for(f_new.root if f_new else None, r["owner_kind"], r["owner"], r["event"])
         own_old, h_old = forms.handler_for(f_old.root if f_old else None, r["owner_kind"], r["owner"], r["event"])
         r["target"], r["target_old"] = h_new, h_old
@@ -223,15 +243,23 @@ def check_row(ctx, r):
             flags.append("CONTROL_MISMATCH")
             notes.append("исходный текст ИиК против base new: %s" % r["control"])
     if r["source"] == "annotation" and mk == "form" and ctx.cfg_old and t_new is not None:
-        frel = metadata.form_xml_rel(r["module"])
-        f_new = ctx.form(ctx.cfg_new, frel)
-        f_old = ctx.form(ctx.cfg_old, frel)
+        f_new = ctx.form(ctx.cfg_new, metadata.form_xml_rel(rel_new))
+        f_old = ctx.form(ctx.cfg_old, metadata.form_xml_rel(rel_old))
         if f_new is not None and f_old is not None:
             b_new = forms.bound_to(f_new.root, r["target"])
             b_old = forms.bound_to(f_old.root, r["target"])
             if b_new != b_old:
                 flags.append("BINDING_CHANGED")
                 notes.append("события, вызывающие %s: old %s → new %s" % (r["target"], b_old or "—", b_new or "—"))
+    if t_new is not None:
+        dep_new = new_mod.deprecated(t_new)
+        if dep_new:
+            dep_old = old_mod.deprecated(t_old) if t_old is not None else None
+            r["deprecated"] = {"new": dep_new, "old": dep_old, "grade": "info" if dep_old else "risk"}
+            flags.append("TARGET_DEPRECATED")
+            notes.append("[%s] вендор пометил метод устаревшим в new (%s)%s" % (
+                "инфо" if dep_old else "риск", dep_new, "; в old тоже" if dep_old else
+                ": найти, что вендор вызывает вместо него, и перенести перехват туда"))
     r["flags"] = flags
     r["notes"] = notes
 
@@ -310,6 +338,81 @@ def check_groups(ctx, rows):
              "proceed": r["proceed"], "method": r["ext_method"]} for r in items],
             "conflict": bool(killers), "verdict": verdict})
     return out
+
+
+def vendor_calls(dump, targets):
+    """Calls of configuration methods in the live code of all modules of a configuration dump, counted by text:
+    {(module rel key, method casefold): n}. targets - [(module rel, method)]. A call counts when it names the method
+    with the qualifier of its module (the common module, the object of a manager module) or, unqualified, inside the
+    module itself or anywhere for a global common module; the declaration does not count. Strings are blanked
+    (ОбщийМодуль("X") is not seen), a call split over lines is not seen: an estimate for TARGET_UNCALLED, not a proof."""
+    want = defaultdict(list)  # method casefold -> [(key, rel key, qualifier casefold or None, anywhere)]
+    globals_ = {g.casefold() for g in dump.global_common_modules()}
+    counts = {}
+    probes = set()
+    for rel, name in targets:
+        key = (metadata.rel_key(rel), name.casefold())
+        if key in counts:
+            continue
+        counts[key] = 0
+        mk = metadata.module_kind(rel)
+        _, owner = metadata.module_owner(rel)
+        qual = owner.casefold() if owner and mk in ("common", "manager", "valuemanager") else None
+        probes.add(name.encode("utf-8"))
+        want[name.casefold()].append((key, metadata.rel_key(rel), qual, mk == "common" and qual in globals_))
+    if not want:
+        return counts
+    pattern = re.compile(r"(?<![\wЁё])(%s)\s*\(" % "|".join(re.escape(n) for n in want), re.IGNORECASE)
+    for dp, _, files in os.walk(dump.root):
+        for fn in files:
+            if not fn.lower().endswith(".bsl"):
+                continue
+            path = os.path.join(dp, fn)
+            with open(path, "rb") as fh:
+                data = fh.read()
+            if not any(b in data for b in probes):  # the vendor writes a name as declared; a byte probe is enough
+                continue
+            rel = metadata.rel_key(os.path.relpath(path, dump.root))
+            lines = fileio.read_text(path).split("\n")
+            for t in bsl.lex_lines(lines):
+                if t.kind != "code" or bsl.DECL_RE.match(t.blank):
+                    continue
+                for m in pattern.finditer(t.blank):
+                    head = t.blank[:m.start()].rstrip()
+                    q = None
+                    if head.endswith("."):
+                        qm = re.search(bsl.IDENT + r"\s*$", head[:-1])
+                        q = qm.group(0).strip().casefold() if qm else "?"
+                    for key, trel, qual, anywhere in want[m.group(1).casefold()]:
+                        if (q is not None and q == qual) or (q is None and (rel == trel or anywhere)):
+                            counts[key] += 1
+    return counts
+
+
+def mark_uncalled(ctx, rows):
+    """TARGET_UNCALLED on obsolete targets the old vendor code called and the new one does not."""
+    if ctx.cfg_old is None:
+        return
+    dep = [r for r in rows if "TARGET_DEPRECATED" in r["flags"] and r["source"] == "annotation" and r["target"]]
+    if not dep:
+        return
+    targets = [(r["module"], r["target"]) for r in dep]
+    c_old, c_new = vendor_calls(ctx.cfg_old, targets), vendor_calls(ctx.cfg_new, targets)
+    for r in dep:
+        key = (metadata.rel_key(r["module"]), r["target"].casefold())
+        r["vendor_calls"] = {"old": c_old.get(key, 0), "new": c_new.get(key, 0)}
+        if r["vendor_calls"]["old"] and not r["vendor_calls"]["new"]:
+            r["flags"].append("TARGET_UNCALLED")
+            r["notes"].append("[риск] вызовов метода в коде вендора: old %d, new 0 — перехват не выполнится"
+                              % r["vendor_calls"]["old"])
+        elif r["vendor_calls"]["new"] and r["deprecated"]["grade"] == "risk":
+            # the vendor marks it obsolete but still calls it in new: the interceptor runs, nothing to do now
+            r["deprecated"]["grade"] = "info"
+            r["notes"] = [n.replace("[риск] вендор пометил", "[инфо] вендор пометил", 1)
+                          .replace(": найти, что вендор вызывает вместо него, и перенести перехват туда", "", 1)
+                          for n in r["notes"]]
+            r["notes"].append("[инфо] вендор сам вызывает метод в new (вызовов в коде вендора: %d) — перехват "
+                              "выполняется, устаревание не срочно" % r["vendor_calls"]["new"])
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -516,6 +619,7 @@ def main(argv=None):
     for n, r in enumerate(rows, 1):
         r["id"] = n
         check_row(ctx, r)
+    mark_uncalled(ctx, rows)
     groups = check_groups(ctx, rows)
     dead = dead_code(ctx, rows)
     elapsed = time.time() - t0

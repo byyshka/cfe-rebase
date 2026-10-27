@@ -29,7 +29,7 @@ import sys
 import time
 from collections import Counter
 
-from . import bsl, fileio, metadata
+from . import bsl, fileio, metadata, refs
 from .control_rebase import inside
 
 KINDS = ("РегистрСведений", "РегистрНакопления", "РегистрБухгалтерии", "РегистрРасчета")
@@ -190,6 +190,7 @@ def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):
         for rel in ext.files(".bsl"):
             stats["modules"] += 1
             findings.extend(scan_module(ext, rel, cfg_old, cfg_new, cache))
+    refs.annotate_liveness(exts, findings, "module", lambda f: f.get("method"))
     states = Counter(v["check"] for v in cache.values() if v is not None)
     stats["registers_changed"] = states["CHANGED"]
     stats["registers_removed"] = states["REGISTER_REMOVED"]

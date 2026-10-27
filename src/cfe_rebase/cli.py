@@ -24,9 +24,14 @@ COMMANDS = {
     "applied": ("applied", "применённая копия модуля: #Удаление и маркеры опустошены, номера строк сохранены"),
     "lint": ("lint", "проверка рабочей копии перед загрузкой: маркеры слияния, структура модулей, потерянные файлы"),
     "borrowed": ("borrowed", "заимствованные объекты против нового релиза: удалённые реквизиты, ресурсы, значения, типы"),
+    "borrow-edit": ("borrow_edit", "правка заимствований в рабочей копии: снять заимствование, переименовать под имя "
+                                   "вендора"),
     "registers": ("registers", "запись в регистры, у которых новый релиз изменил измерения: что код не заполняет"),
     "reads": ("reads", "чтение регистров в запросах, у которых новый релиз изменил состав или регистраторов"),
+    "names": ("names", "имена формы вендора (элементы, реквизиты, параметры, поля объекта), которые читает код "
+                       "заимствованных форм, против old и new"),
     "prepare": ("prepare", "подготовка к адаптации базы из реестра: выгрузка, рабочая копия под git, семь отчётов и план"),
+    "select": ("selection", "выборка из готового отчёта проверки: модуль, объект, флаг, уровень, «до/после», принятые"),
     "mcp": ("mcp_server", "MCP-сервер (stdio) для нейросетей: короткие ответы со ссылками на отчёты"),
 }
 
@@ -34,7 +39,7 @@ COMMANDS = {
 _DUMPS = {"ext": "--ext-root", "old": "--config-old", "new": "--config-new", "out": "--out"}
 DB_FLAGS = {
     "interceptors": _DUMPS, "calls": _DUMPS, "bodies": _DUMPS, "queries": _DUMPS, "borrowed": _DUMPS, "registers": _DUMPS,
-    "reads": _DUMPS,
+    "reads": _DUMPS, "names": _DUMPS,
     "control-rebase": {"ext": "--ext", "old": "--old", "new": "--new", "out": "--out", "work": "--work"},
     "method-diff": {"ext": "--ext", "old": "--old", "new": "--new", "out": "--out"},
     "lint": {"work": "--work", "ext": "--ext", "out": "--out"},
@@ -49,6 +54,7 @@ OPTIONS = {
     "borrowed": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "registers": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "reads": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
+    "names": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "control-rebase": ("--ext", "--old", "--new", "--out", "--work", "--only"),
     "method-diff": ("--ext", "--old", "--new", "--out", "--only", "--method"),
     "lint": ("--work", "--ext", "--only", "--out"),

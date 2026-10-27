@@ -10,7 +10,9 @@ gets no other text check: a lenient decode would drop its Cyrillic markers and r
 the work copy by folder name, extension name or the uuid of Configuration - it survives renaming): files of the source
 extension missing from the work copy - an object that is also gone from the work copy's Configuration.xml is reported
 once as a removal (OBJECT_REMOVED), not as lost files, and so is a form, template or command of an object that is gone
-from the ChildObjects of that object's XML in the work copy (CHILD_REMOVED) - and .bsl modules that lost their BOM
+from the ChildObjects of that object's XML in the work copy (CHILD_REMOVED); an object whose XML is in the work copy
+under another name with the same own uuid (a renamed adoption) is reported once (OBJECT_RENAMED, info) and its files
+are compared under the new path - and .bsl modules that lost their BOM
 (BOM_LOST) or whose line endings changed where the source had pure CRLF: pure LF (EOL_LF) or mixed CRLF and LF
 (EOL_MIXED, at the line of the first bare LF). Mixed line endings in XML are the platform's own format and are not
 reported. A nonexistent --ext, or one without extension dumps, is refused; an extension of the work copy without a pair
@@ -35,7 +37,7 @@ from .control_rebase import cfg_uuid, inside, work_index
 
 TEXT_EXT = {".bsl", ".xml", ".txt", ".html", ".htm", ".json", ".css", ".js"}
 STRICT_EXT = {".bsl", ".xml"}  # the platform reads them as UTF-8: a byte that is not UTF-8 is an error
-INFO = {"OBJECT_REMOVED", "CHILD_REMOVED"}
+INFO = {"OBJECT_REMOVED", "CHILD_REMOVED", "OBJECT_RENAMED"}
 # sub-object folder of an object -> (ChildObjects bucket of metadata.ObjectInfo, what the detail says)
 CHILD_DIRS = {"Forms": ("forms", "форма убрана"), "Templates": ("templates", "макет убран"),
               "Commands": ("commands", "команда убрана")}
@@ -122,11 +124,56 @@ def child_names(work_root, owner_rel, bucket, cache):
     return None if info is None else {n.casefold() for n in getattr(info, bucket)}
 
 
+def renamed_objects(src_files, work_files):
+    """{(folder, source name): work name} of the objects whose XML is gone from the work copy under the source name
+    but is there under another one with the same own uuid: a renamed adoption (borrow-edit --rename) keeps it."""
+    out, by_uuid = {}, {}
+    for rel in sorted(src_files):
+        parts = rel.split("/")
+        if len(parts) != 2 or not parts[1].lower().endswith(".xml") or rel in work_files or \
+                parts[0].lower() not in metadata.FOLDER2KIND:
+            continue
+        uid = metadata.head_uuid(src_files[rel])
+        if not uid:
+            continue
+        if parts[0] not in by_uuid:
+            by_uuid[parts[0]] = {}
+            for w in work_files:
+                wp = w.split("/")
+                if len(wp) == 2 and wp[0] == parts[0] and wp[1].lower().endswith(".xml"):
+                    wu = metadata.head_uuid(work_files[w])
+                    if wu:
+                        by_uuid[parts[0]].setdefault(wu.lower(), wp[1][:-4])
+        new = by_uuid[parts[0]].get(uid.lower())
+        if new is not None and "%s/%s.xml" % (parts[0], new) not in src_files:
+            out[(parts[0], parts[1][:-4])] = new
+    return out
+
+
+def moved(rel, renames):
+    """rel of a source file under the new name of its renamed object."""
+    parts = rel.split("/")
+    if len(parts) == 2 and parts[1].lower().endswith(".xml") and (parts[0], parts[1][:-4]) in renames:
+        return "%s/%s.xml" % (parts[0], renames[(parts[0], parts[1][:-4])])
+    if len(parts) > 2 and (parts[0], parts[1]) in renames:
+        return "/".join([parts[0], renames[(parts[0], parts[1])]] + parts[2:])
+    return rel
+
+
 def compare(src_root, work_root, src_files, work_files):
     """Issues of the work copy against the source extension dump: lost files, BOM and line endings of modules (a pure
     CRLF source module that became pure LF - EOL_LF, mixed - EOL_MIXED). An object gone from Configuration.xml, or a
-    form / template / command gone from the ChildObjects of its object's XML, is one item to confirm, not lost files."""
+    form / template / command gone from the ChildObjects of its object's XML, is one item to confirm, not lost files.
+    An object renamed in the work copy (the same own uuid under another name, OBJECT_RENAMED) has its files compared
+    under the new path."""
     issues = []
+    renames = renamed_objects(src_files, work_files)
+    for (folder, old), new in sorted(renames.items()):
+        issues.append({"file": "%s/%s" % (folder, new), "check": "OBJECT_RENAMED", "line": 0,
+                       "detail": "объект переименован: %s/%s → %s/%s (uuid объекта тот же); файлы сверены с исходными "
+                                 "под новым путём" % (folder, old, folder, new)})
+    if renames:
+        src_files = {moved(rel, renames): p for rel, p in src_files.items()}
     listed = children(work_root)
     removed, removed_children, owners = {}, {}, {}
     for rel in sorted(set(src_files) - set(work_files)):

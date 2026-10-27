@@ -54,5 +54,32 @@ class NearestAssignment(unittest.TestCase):
         self.assertIsNone(self.picked("менеджер", "Вставить"))
 
 
+class SignatureRename(unittest.TestCase):
+    """classify_change: a rename alone is info, a reorder or a new default stays a risk."""
+
+    def sig(self, text):
+        return bsl.Module(text + "\nКонецПроцедуры").methods[0]
+
+    def grade(self, old, new, nargs=4):
+        return calls.classify_change(self.sig(old), self.sig(new), nargs, ["а"] * nargs)
+
+    def test_rename_only_is_info(self):
+        # a real case: ПакетнаяОбработкаТабличнойЧастиСервер.ОбработатьСтрокуТЧ 11.5.17 -> 11.5.27
+        grade, note = self.grade(
+            "Процедура ОбработатьСтрокуТЧ(СтрокаКоллекции, СтруктураДействий, КэшированныеЗначения, "
+            "Коллекция = Неопределено) Экспорт",
+            "Процедура ОбработатьСтрокуТЧ(ТекущаяСтрока, СтруктураДействий, КэшированныеЗначения, "
+            "Коллекция = Неопределено) Экспорт", 3)
+        self.assertEqual(grade, "info")
+        self.assertIn("поз. 1 СтрокаКоллекции → ТекущаяСтрока", note)
+
+    def test_reorder_is_a_risk(self):
+        self.assertEqual(self.grade("Процедура П(А, Б) Экспорт", "Процедура П(Б, А) Экспорт", 2)[0], "risk")
+
+    def test_rename_with_another_default_or_byval_is_a_risk(self):
+        self.assertEqual(self.grade("Процедура П(А, Б = 1) Экспорт", "Процедура П(В, Б = 2) Экспорт", 1)[0], "risk")
+        self.assertEqual(self.grade("Процедура П(А) Экспорт", "Процедура П(Знач В) Экспорт", 1)[0], "risk")
+
+
 if __name__ == "__main__":
     unittest.main()

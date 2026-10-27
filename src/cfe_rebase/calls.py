@@ -13,7 +13,18 @@ strings and #Удаление blocks are not code):
                                                   the nearest assignment above the call; a method found in another
                                                   module the variable is assigned (a branch) is not flagged
 Flags: REMOVED (method was in old, absent in new), MISSING (absent in old and new), NOT_EXPORT,
-TOO_FEW_ARGS, TOO_MANY_ARGS, SIGNATURE_CHANGED (old != new while the call still fits; with a risk grade).
+TOO_FEW_ARGS, TOO_MANY_ARGS, SIGNATURE_CHANGED (old != new while the call still fits; with a risk grade),
+CALLS_DEPRECATED (the vendor marked the method obsolete in this release: region УстаревшиеПроцедурыИФункции or a header
+comment «Устарела»; it still runs, but the vendor no longer keeps it in step - a real extension built a structure the new
+code reads keys from that the obsolete function does not fill). A method obsolete in old too is only counted (stats
+deprecated_in_old_too): the update changed nothing there, and on one real extension that was 63 calls of noise.
+OWNER_REMOVED / OWNER_RENAMED: the module the call goes to belongs to an object an extension of the set adopts, and the
+vendor removed it in new / renamed it (uuid kept, metadata.counterpart_name). The call is flagged whatever method it
+names - the extension's own one included: a real extension adopted ОбработкаТабличнойЧастиСервер, added its own
+function there, 11.5.27 deleted the module, and the call resolved to the extension's method gave no finding
+while the adoption had to go (borrowed OBJECT_REMOVED) and the call with it. Calls from the same object's own modules
+are not flagged for a removed object (they go with it), calls of a global module not for a renamed one (they name no
+module).
 """
 import argparse
 import os
@@ -60,15 +71,21 @@ SELF_CHAIN = {"этотобъект", "thisobject", "этаформа", "thisfor
 FORM_TO_VALUE = {"реквизитформывзначение", "formattributetovalue"}
 DATA_TO_VALUE = {"данныеформывзначение", "formdatatovalue"}
 EXPLAIN = OrderedDict([
+    ("OWNER_REMOVED", "модуль вызова — у заимствованного объекта, который вендор в new удалил: после снятия "
+                      "заимствования вызов (и собственного метода расширения тоже) не скомпилируется"),
+    ("OWNER_RENAMED", "модуль вызова — у заимствованного объекта, который вендор в new переименовал (uuid тот же): "
+                      "вызывать через новое имя"),
     ("REMOVED", "метод был в old, в new его нет"),
     ("MISSING", "метода нет ни в old, ни в new (и ни в одном расширении набора)"),
     ("NOT_EXPORT", "метод вызывается из другого модуля, но не экспортный"),
     ("TOO_FEW_ARGS", "аргументов меньше, чем обязательных параметров"),
     ("TOO_MANY_ARGS", "аргументов больше, чем параметров"),
     ("SIGNATURE_CHANGED", "сигнатура old ≠ new, вызов по числу аргументов проходит"),
+    ("CALLS_DEPRECATED", "вендор пометил метод устаревшим в этом релизе: работает, но вендор его больше не развивает "
+                         "(устаревшие и в old — только счётом)"),
 ])
-SEVERITY = {"REMOVED": 0, "MISSING": 1, "NOT_EXPORT": 1, "TOO_FEW_ARGS": 0, "TOO_MANY_ARGS": 0,
-            "SIGNATURE_CHANGED": 3}
+SEVERITY = {"OWNER_REMOVED": 0, "OWNER_RENAMED": 0, "REMOVED": 0, "MISSING": 1, "NOT_EXPORT": 1, "TOO_FEW_ARGS": 0,
+            "TOO_MANY_ARGS": 0, "SIGNATURE_CHANGED": 3, "CALLS_DEPRECATED": 2}
 
 
 def kind_rel(kind, name, part):
@@ -93,6 +110,14 @@ def classify_change(s_old, s_new, nargs, arg_list):
             d is not None for d in def_new[n_old:]):
         return "info", "в конец добавлены необязательные параметры: %s" % ", ".join(
             p["name"] for p in p_new[n_old:])
+    # only names changed: the same count, Знач and defaults at every position - a call binds by position, so it
+    # passes the same values (УТ 11.5.27: ОбработатьСтрокуТЧ, СтрокаКоллекции -> ТекущаяСтрока). A new name taken from
+    # another position of old is a reorder, not a rename: that stays a risk
+    renamed = [k for k in range(n_old) if names_old[k] != names_new[k]] if len(p_new) == n_old else []
+    if renamed and def_new == def_old and all(a["byval"] == b["byval"] for a, b in zip(p_old, p_new)) \
+            and not any(names_new[k] in names_old for k in renamed) and s_old.export == s_new.export:
+        return "info", "переименованы параметры, число, порядок, Знач и умолчания прежние: %s" % ", ".join(
+            "поз. %d %s → %s" % (k + 1, p_old[k]["name"], p_new[k]["name"]) for k in renamed)
     notes = []
     risky = []
     for k in range(min(nargs, len(p_new))):
@@ -136,6 +161,27 @@ class Resolver(object):
         self.global_old = cfg_old.global_common_modules() if cfg_old else []
         self._base_calls = {}
         self._method_calls = {}
+        self._owners = {}
+
+    def adopted_owner(self, rel):
+        """(kind, name, name in new or None) of the object owning module rel when an extension of the set adopts it and
+        the vendor removed it in new (None) or renamed it (uuid kept); None for anything else."""
+        kind, name = metadata.module_owner(rel)
+        if kind is None:
+            return None
+        key = (kind, name.casefold())
+        if key not in self._owners:
+            res = None
+            for e in self.exts:
+                o = e.object(kind, name)
+                if o is None or not o.adopted:
+                    continue
+                other = metadata.counterpart_name(e, kind, name, self.new)
+                if other is None or other.casefold() != name.casefold():
+                    res = (kind, name, other)
+                    break
+            self._owners[key] = res
+        return self._owners[key]
 
     def is_common(self, name):
         k = name.casefold()
@@ -188,6 +234,29 @@ class Resolver(object):
             if m is not None:
                 return g, m
         return None, None
+
+
+def renamed_rel(rel, new_name):
+    """The same module of the object under its new name."""
+    parts = metadata.norm_rel(rel).split("/")
+    parts[1] = new_name
+    return "/".join(parts)
+
+
+def owner_note(owner, own_method):
+    """{flag, object, new_name, note} of a call into a module of an adopted object the vendor removed or renamed;
+    own_method - the method is the extension's own (in new the vendor has none of that name there)."""
+    kind, name, new = owner
+    title = "%s.%s" % (kind, name)
+    if new is None:
+        todo = ("метод собственный, расширения: перенести его в собственный модуль расширения и вызывать оттуда"
+                if own_method else "метод вендора: найти, что вендор вызывает вместо него в new, и вызывать это")
+        return {"flag": "OWNER_REMOVED", "object": title, "new_name": None,
+                "note": "вендор удалил %s в new — заимствование снимается (borrowed OBJECT_REMOVED), вызов перестанет "
+                        "компилироваться; %s" % (title, todo)}
+    return {"flag": "OWNER_RENAMED", "object": title, "new_name": new,
+            "note": "%s: в вызове заменить %s на %s (заимствование переименовать — borrow-edit --rename %s)" % (
+                metadata.renamed_note(kind, name, new), name, new, title)}
 
 
 def module_string(name):
@@ -278,20 +347,21 @@ def shown_call(chain, name):
     return ".".join(chain + [name])
 
 
-def copy_context(rs, cfg_new, cfg_old, rel, caller, call):
+def copy_context(rs, cfg_new, cfg_old, rel, caller, call, rel_old=None):
     """A call inside an &Вместо / &ИзменениеИКонтроль method of an adopted module, against the vendor body of the
     intercepted method: {annotation, target_in_new, vendor_old, vendor_new, new_as}. target_in_new - the intercepted
     method still exists in the new release; vendor_old / vendor_new - the same call (qualifier,
     name and arguments as written) is in the old / new body (vendor_old None without an old release); new_as - how the
     new body calls the same name with the same arguments under another qualifier (where the vendor moved it). None for
-    any other caller."""
+    any other caller. rel_old - the module in old when the vendor renamed its object (rel is the one in new)."""
     if caller is None:
         return None
     for kind, target, _ in caller.interceptors:
         if kind in ("Вместо", "ИзменениеИКонтроль") and target:
             q = qualifier(call["chain"])
             new = rs.method_calls(cfg_new, rel, target).get(call["norm"], {})
-            old = rs.method_calls(cfg_old, rel, target).get(call["norm"], {}) if cfg_old is not None else None
+            old = rs.method_calls(cfg_old, rel_old or rel, target).get(call["norm"], {}) if cfg_old is not None \
+                else None
             return {"annotation": '&%s("%s")' % (kind, target), "target_in_new": cfg_new.find_method(rel, target)
                     is not None, "vendor_old": None if old is None else q in old, "vendor_new": q in new,
                     "new_as": [new[k] for k in sorted(new) if k != q][:3]}
@@ -323,6 +393,7 @@ def advice(flags, copy):
 
 
 def analyze(args):
+    dep_targets = []  # (finding, module rel in new, method) of CALLS_DEPRECATED
     metadata.check_config(args.config_new, "--config-new")
     if args.config_old:
         metadata.check_config(args.config_old, "--config-old")
@@ -341,7 +412,12 @@ def analyze(args):
             if mod is None:
                 continue
             stats["modules"] += 1
-            adopted = cfg_new.exists(rel) or (cfg_old is not None and cfg_old.exists(rel))
+            # a vendor rename keeps the uuid: the module of a renamed object is under its name in each release
+            rel_new = metadata.counterpart_rel(ext, rel, cfg_new)[0]
+            rel_old = metadata.counterpart_rel(ext, rel, cfg_old)[0] if cfg_old is not None else rel
+            adopted = cfg_new.exists(rel_new) or (cfg_old is not None and cfg_old.exists(rel_old))
+            self_owner = metadata.module_owner(rel)
+            self_owner = (self_owner[0], self_owner[1].casefold()) if self_owner[0] else None
             toks = mod.toks
             ranges = [(m.decl_line, m.end_line) for m in mod.methods]
             mvars = bsl.module_vars(toks, ranges)
@@ -360,8 +436,8 @@ def analyze(args):
                         continue
                     if mod.find(name) is not None:
                         continue  # own method of the module: not a configuration call
-                    if adopted and (cfg_new.find_method(rel, name) is not None or rs.ext_defs(rel, name) or (
-                            cfg_old is not None and cfg_old.find_method(rel, name) is not None)):
+                    if adopted and (cfg_new.find_method(rel_new, name) is not None or rs.ext_defs(rel, name) or (
+                            cfg_old is not None and cfg_old.find_method(rel_old, name) is not None)):
                         target = ("local", rel, True, None)
                     else:
                         g, _ = rs.global_method(name, cfg_new, rs.global_new)
@@ -412,6 +488,15 @@ def analyze(args):
                 else:
                     continue
                 cls, trel, is_local, part = target
+                trel_new, trel_old = (rel_new, rel_old) if trel == rel else (trel, trel)
+                owner = None if is_local else rs.adopted_owner(trel)
+                if owner is not None and owner[2] is None and (owner[0], owner[1].casefold()) == self_owner:
+                    owner = None  # a module of the removed object itself: its code goes with the adoption
+                if owner is not None and owner[2] is not None:
+                    if cls == "global":
+                        owner = None  # a global module is called without its name: the rename does not touch it
+                    elif trel != rel:
+                        trel_new = renamed_rel(trel, owner[2])
                 stats["calls_" + cls] += 1
                 if part in ("manager", "valuemanager") and low in PLATFORM_MANAGER:
                     stats["platform_manager"] += 1
@@ -419,8 +504,8 @@ def analyze(args):
                 if part in ("object", "recordset") and low in PLATFORM_OBJECT:
                     stats["platform_object"] += 1
                     continue
-                t_new = cfg_new.find_method(trel, name)
-                t_old = cfg_old.find_method(trel, name) if cfg_old else None
+                t_new = cfg_new.find_method(trel_new, name)
+                t_old = cfg_old.find_method(trel_old, name) if cfg_old else None
                 flags = []
                 note = ""
                 layer = "конфигурация"
@@ -439,8 +524,8 @@ def analyze(args):
                         flags.append("REMOVED")
                         note = "был в old (стр. %d), в new нет" % t_old.decl_line
                     else:
-                        module_known = cfg_new.exists(trel) or (cfg_old is not None and cfg_old.exists(trel)) or any(
-                            e.exists(trel) for e in exts)
+                        module_known = cfg_new.exists(trel_new) or (
+                            cfg_old is not None and cfg_old.exists(trel_old)) or any(e.exists(trel) for e in exts)
                         if part in ("object", "recordset"):
                             stats["unresolved_object_method"] += 1
                             continue
@@ -471,15 +556,32 @@ def analyze(args):
                         note = "аргументов %d, допустимо [%d..%d]" % (nargs, req, tot)
                     if not flags and t_new is not None and t_old is not None and t_new.sig_key() != t_old.sig_key():
                         grade, note = classify_change(t_old, t_new, nargs, c["arg_list"])
-                        if grade == "risk" and adopted and c["norm"] in rs.base_calls(rel):
+                        if grade == "risk" and adopted and c["norm"] in rs.base_calls(rel_new):
                             grade, note = "info", "вызов дословно как в модуле new (перенесённая копия); " + note
                         flags.append("SIGNATURE_CHANGED")
                         stats["sig_changed_" + grade] += 1
                         note = "[%s] %s" % ("риск" if grade == "risk" else "инфо", note)
+                deprecated = None
+                # the module under its name in each release: a vendor rename keeps the uuid, not the path
+                dep_new = cfg_new.module(trel_new).deprecated(t_new) if t_new is not None else None
+                if dep_new:
+                    dep_old = cfg_old.module(trel_old).deprecated(t_old) if t_old is not None else None
+                    if dep_old:  # obsolete already in old: the update changed nothing, counted only
+                        stats["deprecated_in_old_too"] += 1
+                    else:
+                        deprecated = {"new": dep_new, "old": None, "grade": "risk"}
+                        flags.append("CALLS_DEPRECATED")
+                        note = "; ".join(x for x in (note, "[риск] вендор пометил метод устаревшим в new (%s): "
+                                                     "найти, что вендор вызывает вместо него" % dep_new) if x)
+                owned = None
+                if owner is not None:
+                    owned = owner_note(owner, layer != "конфигурация")
+                    flags.insert(0, owned["flag"])
+                    note = "; ".join(x for x in (owned.pop("note"), note) if x)
                 if not flags:
                     continue
                 shown = shown_call(chain, name)
-                copy = copy_context(rs, cfg_new, cfg_old, rel, caller, c) if adopted else None
+                copy = copy_context(rs, cfg_new, cfg_old, rel_new, caller, c, rel_old) if adopted else None
                 findings.append({
                     "ext": ext.name, "module": rel, "module_title": metadata.module_title(rel), "line": c["line"],
                     "caller": caller.name if caller else "", "call": shown, "args": nargs, "class": cls,
@@ -490,7 +592,34 @@ def analyze(args):
                     "flags": flags, "note": note, "copy": copy, "advice": advice(flags, copy),
                     "caller_live": index.liveness(rel, caller),
                     "src": mod.lines[c["line"] - 1].strip()[:200] if 0 < c["line"] <= len(mod.lines) else ""})
+                if owned:
+                    findings[-1]["owner"] = owned
+                if deprecated:
+                    findings[-1]["deprecated"] = deprecated
+                    dep_targets.append((findings[-1], trel_new, name))
+    vendor_still_calls(cfg_new, dep_targets)
     return cfg_new, cfg_old, exts, findings, stats
+
+
+DEP_TODO = ": найти, что вендор вызывает вместо него"
+VENDOR_STILL_CALLS = "вендор сам вызывает метод в new (вызовов в коде вендора: %d) — работает, устаревание не срочно"
+
+
+def vendor_still_calls(cfg_new, dep_targets):
+    """CALLS_DEPRECATED of a method the vendor's own new code still calls (ВзаиморасчетыСервер.
+    ПолучитьМаксимальнуюДатуВКоллекцииДокументов: РеализацияТоваровУслугЛокализация calls it in 11.5.27) is info, not
+    a risk: deprecated.vendor_calls_new - the count (interceptors.vendor_calls, by text), the note says so."""
+    if not dep_targets:
+        return
+    from .interceptors import vendor_calls  # interceptors imports nothing of calls; kept local all the same
+    counts = vendor_calls(cfg_new, [(rel, name) for _, rel, name in dep_targets])
+    for f, rel, name in dep_targets:
+        n = counts.get((metadata.rel_key(rel), name.casefold()), 0)
+        f["deprecated"]["vendor_calls_new"] = n
+        if n:
+            f["deprecated"]["grade"] = "info"
+            f["note"] = f["note"].replace("[риск] вендор пометил метод устаревшим", "[инфо] вендор пометил метод "
+                                          "устаревшим", 1).replace(DEP_TODO, "", 1) + "; " + VENDOR_STILL_CALLS % n
 
 
 def render(cfg_new, cfg_old, exts, findings, stats, elapsed):
@@ -508,10 +637,10 @@ def render(cfg_new, cfg_old, exts, findings, stats, elapsed):
     resolved = ", ".join("%s — %d" % (k[6:], v) for k, v in sorted(stats.items()) if k.startswith("calls_"))
     md.append("Разрешено вызовов по видам: %s. Методы платформы у менеджеров/объектов пропущены: %d/%d; "
               "не разрешено (метод объекта/менеджера не найден, вероятно платформенный): %d/%d; "
-              "локальные переменные и параметры: %d." % (
+              "локальные переменные и параметры: %d; вызовы методов, устаревших уже в old (не находка): %d." % (
                   resolved, stats.get("platform_manager", 0), stats.get("platform_object", 0),
                   stats.get("unresolved_object_method", 0), stats.get("unresolved_manager_method", 0),
-                  stats.get("skipped_shadowed", 0)))
+                  stats.get("skipped_shadowed", 0), stats.get("deprecated_in_old_too", 0)))
     md.append("")
     main = [f for f in findings if f["flags"] != ["SIGNATURE_CHANGED"] or f["note"].startswith("[риск]")]
     info = [f for f in findings if f["flags"] == ["SIGNATURE_CHANGED"] and not f["note"].startswith("[риск]")]
