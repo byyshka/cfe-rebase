@@ -129,7 +129,8 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
         "calls": {"findings": len(calls), "flags": _flag_counts(calls)},
         "queries": {"findings": len(data["queries"]["findings"]), "unjudged": len(data["queries"]["masked"])},
         "bodies": {"copies": len(cases), "vendor_changed": sum(
-            1 for c in cases if (c.get("change") or {}).get("old->new", "=") != "=")},
+            1 for c in cases if (c.get("change") or {}).get("old->new", "=") != "="),
+            "calltype": sum(1 for c in cases if c.get("binding") == "callType")},
         "borrowed": {"findings": len(data["borrowed"]["findings"]), "checks": dict(sorted(Counter(
             f["check"] for f in data["borrowed"]["findings"]).items()))},
         "registers": {"findings": len(data["registers"]["findings"]), "checks": dict(sorted(Counter(
@@ -164,8 +165,8 @@ def screen(res):
                                                    _flags_text(res["interceptors"]["flags"])),
         "calls: находок с флагами %d%s" % (res["calls"]["findings"], _flags_text(res["calls"]["flags"])),
         "queries: находок %d, не судится %d" % (res["queries"]["findings"], res["queries"]["unjudged"]),
-        "bodies: копий &Вместо %d, оригинал у вендора изменился %d" % (res["bodies"]["copies"],
-                                                                      res["bodies"]["vendor_changed"]),
+        "bodies: копий &Вместо %d (из них callType=Override %d), оригинал у вендора изменился %d" % (
+            res["bodies"]["copies"], res["bodies"].get("calltype", 0), res["bodies"]["vendor_changed"]),
         "borrowed: находок %d%s" % (res["borrowed"]["findings"], _flags_text(res["borrowed"]["checks"])),
         "registers: находок %d%s" % (res["registers"]["findings"], _flags_text(res["registers"]["checks"])),
     ]

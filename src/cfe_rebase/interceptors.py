@@ -136,7 +136,7 @@ def collect(ctx):
                 if not b["callType"]:
                     continue
                 m = mod.find(b["handler"]) if mod is not None else None
-                own = b["owner_kind"] != "form" and b["owner"] not in base_names
+                own = own_element(b, base_names)
                 rows.append({"ext": ext.name, "ext_purpose": ext.purpose, "module": mrel, "form": frel,
                              "module_title": metadata.module_title(mrel), "mkind": "form", "source": "callType",
                              "kind": forms.CALLTYPE_RU.get(b["callType"], b["callType"]), "callType": b["callType"],
@@ -145,6 +145,56 @@ def collect(ctx):
                              "ext_line": m.decl_line if m else None, "proceed": m.has_proceed if m else False,
                              "own_element": own, "_ext": ext, "_m": m})
     return rows
+
+
+def own_element(b, base_names):
+    """The binding sits on an element or a command of the extension itself (not in the <BaseForm> snapshot)."""
+    return b["owner_kind"] != "form" and b["owner"] not in base_names
+
+
+def override_copies(ext, form, cfg_old, cfg_new):
+    """Handlers bound in the adopted forms of ext by callType="Override" without ПродолжитьВызов: the platform runs
+    the extension method instead of the vendor handler of the event, so the method is a frozen copy of that handler
+    exactly like &Вместо, only the binding is in Form.xml. [{form, module, owner_kind, owner, event, xml_line,
+    ext_method, method (bsl.Method), target_old, target_new}] - the vendor handler of the event in the old and the new
+    release, the forms looked up under the name of each release (a vendor rename keeps the uuid). Left out: own
+    elements and commands of the extension (nothing to copy), Before / After (the vendor body runs), a handler that
+    calls ПродолжитьВызов (a wrapper), a binding without its method (DEAD_BINDING of the registry), a method that is an
+    &Вместо of the same target too (bodies counts it once, by the annotation), an event the vendor binds to no handler
+    in either release (the extension adds behaviour, there is no vendor body to freeze)."""
+    out = []
+    for frel in ext.files("/Form.xml"):
+        f = form(ext, frel)
+        if f is None or not f.borrowed:
+            continue
+        mrel = metadata.form_module_rel(frel)
+        mod = ext.module(mrel)
+        if mod is None:
+            continue
+        base_names = f.names(f.base)
+        f_new = f_old = None
+        loaded = False
+        for b in f.bindings():
+            if b["callType"] != "Override" or own_element(b, base_names):
+                continue
+            m = mod.find(b["handler"])
+            if m is None or m.has_proceed:
+                continue
+            if not loaded:
+                f_new = form(cfg_new, metadata.counterpart_rel(ext, frel, cfg_new)[0])
+                f_old = form(cfg_old, metadata.counterpart_rel(ext, frel, cfg_old)[0])
+                loaded = True
+            h_new = forms.handler_for(f_new.root if f_new else None, b["owner_kind"], b["owner"], b["event"])[1]
+            h_old = forms.handler_for(f_old.root if f_old else None, b["owner_kind"], b["owner"], b["event"])[1]
+            if not h_new and not h_old:
+                continue
+            if any(k == "Вместо" and t.casefold() in {(h_new or "").casefold(), (h_old or "").casefold()}
+                   for k, t, _ in m.interceptors):
+                continue
+            out.append({"form": frel, "module": mrel, "owner_kind": b["owner_kind"], "owner": b["owner"],
+                        "event": b["event"], "xml_line": b["line"], "ext_method": m.name, "method": m,
+                        "target_old": h_old, "target_new": h_new})
+    return out
 
 
 def check_row(ctx, r):
@@ -233,6 +283,12 @@ def check_row(ctx, r):
     if t_new is not None and t_old is not None:
         r["body_change"] = bsl.change_label(bsl.diff_stats(bsl.body_code(old_mod, t_old)[1:],
                                                            bsl.body_code(new_mod, t_new)[1:]))
+    if r["source"] == "callType" and r["callType"] == "Override" and not r["proceed"] and not r["own_element"] \
+            and r["body_change"] not in (None, "="):
+        # a frozen copy like &Вместо: no flag (an &Вместо copy gets none either), the note sends it to check_copies
+        notes.append("копия обработчика вендора (callType=Override без ПродолжитьВызов), вендор изменил тело old→new "
+                     "(%s): сверить check_copies, перенести port_replace с copy_method=%s" % (r["body_change"],
+                                                                                            r["ext_method"]))
     if r["kind"] == "ИзменениеИКонтроль" and m is not None and t_new is not None:
         ext_mod = r["_ext"].module(r["module"])
         ext_ctrl = bsl.body_control(ext_mod, m)[1:]

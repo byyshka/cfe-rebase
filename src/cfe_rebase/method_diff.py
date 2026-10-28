@@ -4,7 +4,9 @@
     cfe-rebase method-diff --ext <extension dumps root> --old <vendor old dump> --new <vendor new dump> --out <dir>
                           [--only <extension name>] [--method <vendor method name>]
 
-For every interceptor annotation (&Вместо, &Перед, &После, &ИзменениеИКонтроль) of the extension dumps: kind, target,
+For every interceptor annotation (&Вместо, &Перед, &После, &ИзменениеИКонтроль) of the extension dumps, and every vendor
+form handler an adopted form replaces by callType="Override" in Form.xml without ПродолжитьВызов (kind «Вместо
+(callType)», a frozen copy like &Вместо: interceptors.override_copies): kind, target,
 module, signature old/new and the changed blocks of the intercepted vendor method, or «тело не изменилось». Interceptors
 of one method (several extensions or kinds) share one set of hunks. The body is compared from the line after the
 parameter list to the end line: for &ИзменениеИКонтроль in the control view (lines trimmed, empty lines dropped,
@@ -19,10 +21,11 @@ import sys
 import time
 from collections import Counter, OrderedDict
 
-from . import bsl, fileio, merge_copy, metadata
+from . import bsl, fileio, interceptors as icp, merge_copy, metadata, refs
 from .control_rebase import refuse_out_inside
 
-KIND_ORDER = ("Вместо", "Перед", "После", "ИзменениеИКонтроль")
+CALLTYPE_KIND = "Вместо (callType)"
+KIND_ORDER = ("Вместо", CALLTYPE_KIND, "Перед", "После", "ИзменениеИКонтроль")
 
 
 def view(mod, m, control):
@@ -48,8 +51,12 @@ def span(items, at):
     return "%d" % items[0][0] if len(items) == 1 else "%d-%d" % (items[0][0], items[-1][0])
 
 
-def collect(exts, only_method):
+def collect(exts, only_method, cfg_old=None, cfg_new=None):
+    """Groups of interceptors by vendor method. With both releases given, the callType="Override" copies of adopted
+    forms join too: their target is the vendor handler of the event (target_old - the old one, when the vendor
+    re-bound the event)."""
     groups = OrderedDict()
+    form = refs.form_cache()
     for ext in exts:
         for rel in ext.files(".bsl"):
             mod = ext.module(rel)
@@ -64,6 +71,21 @@ def collect(exts, only_method):
                                                 "target": target, "interceptors": []})
                     g["interceptors"].append({"ext": ext.name, "kind": kind, "method": m.name,
                                               "proceed": m.has_proceed, "line": line})
+        if cfg_old is None or cfg_new is None:
+            continue
+        for o in icp.override_copies(ext, form, cfg_old, cfg_new):
+            target = o["target_new"] or o["target_old"]
+            if only_method and only_method.casefold() not in {(o["target_new"] or "").casefold(),
+                                                               (o["target_old"] or "").casefold()}:
+                continue
+            key = (metadata.rel_key(o["module"]), target.casefold())
+            g = groups.setdefault(key, {"module": o["module"], "module_title": metadata.module_title(o["module"]),
+                                        "target": target, "interceptors": []})
+            if not g["interceptors"] and o["target_old"] and o["target_old"] != target:
+                g["target_old"] = o["target_old"]  # the vendor re-bound the event: the old body is under this name
+            g["interceptors"].append({"ext": ext.name, "kind": CALLTYPE_KIND, "method": o["ext_method"],
+                                      "proceed": False, "line": o["method"].decl_line, "form": o["form"],
+                                      "xml_line": o["xml_line"], "event": "%s.%s" % (o["owner"], o["event"])})
     return list(groups.values())
 
 
@@ -73,7 +95,7 @@ def analyse(g, cfg_old, cfg_new, ext=None):
     rel_old = metadata.counterpart_rel(ext, g["module"], cfg_old)[0] if ext is not None else g["module"]
     rel_new = metadata.counterpart_rel(ext, g["module"], cfg_new)[0] if ext is not None else g["module"]
     vo, vn = cfg_old.module(rel_old), cfg_new.module(rel_new)
-    mo = vo.find(g["target"]) if vo else None
+    mo = vo.find(g.get("target_old") or g["target"]) if vo else None
     mn = vn.find(g["target"]) if vn else None
     g["old_lines"] = "%d-%d" % (mo.decl_line, mo.end_line) if mo else None
     g["new_lines"] = "%d-%d" % (mn.decl_line, mn.end_line) if mn else None
@@ -110,8 +132,12 @@ def analyse(g, cfg_old, cfg_new, ext=None):
     return g
 
 
+def kind_text(kind):
+    return kind if kind == CALLTYPE_KIND else "&" + kind
+
+
 def who(g):
-    return "; ".join("%s &%s%s → %s" % (i["ext"], i["kind"], " +ПВ" if i["proceed"] else "", i["method"])
+    return "; ".join("%s %s%s → %s" % (i["ext"], kind_text(i["kind"]), " +ПВ" if i["proceed"] else "", i["method"])
                      for i in g["interceptors"])
 
 
@@ -125,7 +151,8 @@ def render(args, groups, elapsed):
     md.append("")
     md.append("Перехватов: %d (%s), методов вендора: %d; тело изменилось — %d, не изменилось — %d, прочее (нет "
               "метода, новый метод) — %d." % (
-                  sum(kinds.values()), ", ".join("&%s — %d" % (k, kinds[k]) for k in KIND_ORDER if kinds.get(k)),
+                  sum(kinds.values()), ", ".join("%s — %d" % (kind_text(k), kinds[k]) for k in KIND_ORDER
+                                                 if kinds.get(k)),
                   len(groups), len(changed), sum(1 for g in groups if g["status"] == "тело не изменилось"),
                   sum(1 for g in groups if "hunks" in g and not g["hunks"] and g["status"] != "тело не изменилось")))
     md.append("")
@@ -146,6 +173,8 @@ def render(args, groups, elapsed):
         md.append("")
         md.append("- Перехваты: %s." % who(g))
         md.append("- Модуль: `%s`, строки old %s, new %s." % (g["module"], g["old_lines"], g["new_lines"]))
+        if g.get("target_old"):
+            md.append("- Вендор перепривязал событие: в old обработчик `%s`." % g["target_old"])
         if g["sig_changed"]:
             md.append("- Сигнатура old: `%s` → new: `%s`." % (g["sig_old"], g["sig_new"]))
         if g["hunks"]:
@@ -180,7 +209,7 @@ def main(argv=None):
     cfg_old, cfg_new = metadata.Dump(args.old, "old"), metadata.Dump(args.new, "new")
     by_name = {e.name: e for e in exts}
     groups = [analyse(g, cfg_old, cfg_new, by_name.get(g["interceptors"][0]["ext"]))
-              for g in collect(exts, args.method)]
+              for g in collect(exts, args.method, cfg_old, cfg_new)]
     elapsed = time.time() - t0
     md_path, _ = fileio.write_report(args.out, "report", render(args, groups, elapsed), {
         "ext": args.ext, "old": args.old, "new": args.new, "only": args.only, "method": args.method,

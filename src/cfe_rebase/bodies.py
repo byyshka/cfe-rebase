@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Frozen copies: every &Вместо without ПродолжитьВызов in the extensions, compared with the base method
-of the old and the new configuration release.
+of the old and the new configuration release. A vendor form handler replaced by callType="Override" in the Form.xml of
+an adopted form (interceptors.override_copies) is the same frozen copy, only bound in the XML: such a case carries
+binding "callType" and kind «Вместо (callType)», its target is the vendor handler of the event.
 
 For each copy: line ranges of the copy, base old and base new; line diffs old->copy (author edits and older
 drift), old->new (what the vendor changed), copy->new (what porting has to reconcile); similarity ratios
@@ -15,13 +17,15 @@ import sys
 import time
 from collections import Counter
 
-from . import bsl, fileio, metadata
+from . import bsl, fileio, interceptors, metadata, refs
 from .control_rebase import refuse_out_inside
 
 BASIS = {"new": "перенесена на new", "mixed": "частично перенесена", "old": "копия old + правки",
          "older": "старше old или переписана", "same-old": "= old", "same-new": "= new"}
 # the copy is ready for the new release: it is the new body, or every vendor change is in it
 PORTED = ("new", "same-new")
+# a copy bound by callType="Override" in Form.xml carries binding "callType" and this kind; an &Вместо copy has neither
+CALLTYPE_KIND = "Вместо (callType)"
 
 
 def body(module, method, code_only):
@@ -169,6 +173,35 @@ def hunks_md(hunks, la, lb, limit):
     return out
 
 
+def compare(case, mod, m, old_mod, t_old, new_mod, t_new, code_only):
+    """Fills a case: the copy m of mod against the vendor method t_old of old_mod and t_new of new_mod; a missing vendor
+    method gives a note instead."""
+    case.update({"copy_lines": [m.decl_line, m.end_line],
+                 "old_lines": [t_old.decl_line, t_old.end_line] if t_old else None,
+                 "new_lines": [t_new.decl_line, t_new.end_line] if t_new else None})
+    if t_new is None or t_old is None:
+        case["note"] = "нет базового метода в %s" % " и ".join(
+            x for x, t in (("old", t_old), ("new", t_new)) if t is None)
+        return case
+    c = body(mod, m, code_only)
+    o = body(old_mod, t_old, code_only)
+    n = body(new_mod, t_new, code_only)
+    # ratios and basis on the body without the declaration line: the copy always has another name
+    s_co, s_cn, s_on = bsl.diff_stats(o[1:], c[1:]), bsl.diff_stats(n[1:], c[1:]), bsl.diff_stats(o[1:], n[1:])
+    tw = three_way(o, c, n)
+    case.update({
+        "len": {"copy": len(c), "old": len(o), "new": len(n)},
+        "ratio": {"copy~old": s_co["ratio"], "copy~new": s_cn["ratio"], "old~new": s_on["ratio"]},
+        "change": {"old->copy": bsl.change_label(s_co), "old->new": bsl.change_label(s_on),
+                   "copy->new": bsl.change_label(bsl.diff_stats(c[1:], n[1:]))},
+        "basis": basis(s_co, s_cn, s_on, len(o) - 1, tw),
+        "vendor_hunks": len(tw), "vendor_in_copy": sum(1 for h in tw if h["in_copy"]),
+        "drift_hunks": sum(1 for h in tw if h["class"].startswith("ДРЕЙФ")),
+        "diff_old_copy": bsl.diff_hunks(o, c), "diff_old_new": bsl.diff_hunks(o, n),
+        "diff_copy_new": bsl.diff_hunks(c, n), "three_way": tw})
+    return case
+
+
 def analyze(args):
     metadata.check_config(args.config_new, "--config-new")
     metadata.check_config(args.config_old, "--config-old")
@@ -177,6 +210,7 @@ def analyze(args):
     exts = metadata.find_extensions(args.ext_root, args.ext, args.skip)
     if not exts:
         sys.exit("no extension dumps found under --ext-root")
+    form = refs.form_cache()
     cases = []
     for ext in exts:
         for rel in ext.files(".bsl"):
@@ -192,38 +226,35 @@ def analyze(args):
                     old_mod = cfg_old.module(metadata.counterpart_rel(ext, rel, cfg_old)[0])
                     t_new = new_mod.find(target) if new_mod else None
                     t_old = old_mod.find(target) if old_mod else None
-                    case = {"ext": ext.name, "module": rel, "module_title": metadata.module_title(rel),
-                            "target": target, "copy_method": m.name, "copy_lines": [m.decl_line, m.end_line],
-                            "old_lines": [t_old.decl_line, t_old.end_line] if t_old else None,
-                            "new_lines": [t_new.decl_line, t_new.end_line] if t_new else None}
-                    if t_new is None or t_old is None:
-                        case["note"] = "нет базового метода в %s" % " и ".join(
-                            x for x, t in (("old", t_old), ("new", t_new)) if t is None)
-                        cases.append(case)
-                        continue
-                    c = body(mod, m, args.code_only)
-                    o = body(old_mod, t_old, args.code_only)
-                    n = body(new_mod, t_new, args.code_only)
-                    # ratios and basis on the body without the declaration line: the copy always has another name
-                    s_co, s_cn, s_on = bsl.diff_stats(o[1:], c[1:]), bsl.diff_stats(n[1:], c[1:]), \
-                        bsl.diff_stats(o[1:], n[1:])
-                    tw = three_way(o, c, n)
-                    case.update({
-                        "len": {"copy": len(c), "old": len(o), "new": len(n)},
-                        "ratio": {"copy~old": s_co["ratio"], "copy~new": s_cn["ratio"], "old~new": s_on["ratio"]},
-                        "change": {"old->copy": bsl.change_label(s_co), "old->new": bsl.change_label(s_on),
-                                   "copy->new": bsl.change_label(bsl.diff_stats(c[1:], n[1:]))},
-                        "basis": basis(s_co, s_cn, s_on, len(o) - 1, tw),
-                        "vendor_hunks": len(tw), "vendor_in_copy": sum(1 for h in tw if h["in_copy"]),
-                        "drift_hunks": sum(1 for h in tw if h["class"].startswith("ДРЕЙФ")),
-                        "diff_old_copy": bsl.diff_hunks(o, c), "diff_old_new": bsl.diff_hunks(o, n),
-                        "diff_copy_new": bsl.diff_hunks(c, n), "three_way": tw})
-                    cases.append(case)
+                    cases.append(compare({"ext": ext.name, "module": rel, "module_title": metadata.module_title(rel),
+                                          "target": target, "copy_method": m.name}, mod, m, old_mod, t_old, new_mod,
+                                         t_new, args.code_only))
+        # a vendor form handler replaced by callType="Override" in Form.xml: the same frozen copy, bound in the XML
+        for o in interceptors.override_copies(ext, form, cfg_old, cfg_new):
+            rel = o["module"]
+            new_mod = cfg_new.module(metadata.counterpart_rel(ext, rel, cfg_new)[0])
+            old_mod = cfg_old.module(metadata.counterpart_rel(ext, rel, cfg_old)[0])
+            t_new = new_mod.find(o["target_new"]) if (new_mod and o["target_new"]) else None
+            t_old = old_mod.find(o["target_old"]) if (old_mod and o["target_old"]) else None
+            case = {"ext": ext.name, "module": rel, "module_title": metadata.module_title(rel), "binding": "callType",
+                    "kind": CALLTYPE_KIND, "target": o["target_new"] or o["target_old"],
+                    "copy_method": o["ext_method"], "form": o["form"], "xml_line": o["xml_line"], "owner": o["owner"],
+                    "event": o["event"]}
+            if o["target_old"] and o["target_new"] and o["target_old"] != o["target_new"]:
+                case["target_old"] = o["target_old"]
+            cases.append(compare(case, ext.module(rel), o["method"], old_mod, t_old, new_mod, t_new, args.code_only))
     return cfg_new, cfg_old, exts, cases
 
 
+def target_cell(c):
+    if c.get("binding") != "callType":
+        return c["target"]
+    return "%s (callType %s.%s%s)" % (c["target"], c["owner"], c["event"],
+                                      ", old: %s" % c["target_old"] if c.get("target_old") else "")
+
+
 def render(cfg_new, cfg_old, exts, cases, args, elapsed):
-    md = ["# Копии тел `&Вместо` без `ПродолжитьВызов`", ""]
+    md = ["# Копии тел `&Вместо` и `callType=\"Override\"` без `ПродолжитьВызов`", ""]
     md.append("new: `%s` (%s), old: `%s` (%s). Расширений: %d, копий: %d. Сравнение: %s. Время: %.1f с." % (
         cfg_new.root, cfg_new.version, cfg_old.root, cfg_old.version, len(exts), len(cases),
         "только код (без комментариев)" if args.code_only else "строки с комментариями, пробелы схлопнуты",
@@ -236,12 +267,14 @@ def render(cfg_new, cfg_old, exts, cases, args, elapsed):
               "автор переписал тело (эвристика, различить их по трём версиям нельзя). Если изменения вендора не решают "
               "(их нет или автор переписал те же места) — по коэффициентам: copy~new выше copy~old больше чем на 0,01 — "
               "перенесена на new. Коэффициенты и основа считаются по телу без строки объявления (у копии всегда другое "
-              "имя), диффы — с ней. ДРЕЙФ — изменения вендора old→new, которых нет в копии.")
+              "имя), диффы — с ней. ДРЕЙФ — изменения вендора old→new, которых нет в копии. «Вместо (callType)» — "
+              "обработчик события формы вендора заменён привязкой `callType=\"Override\"` в Form.xml расширения: "
+              "та же копия, цель — обработчик события в форме вендора.")
     md.append("")
     md.append(fileio.md_table(
         ["Расширение", "Модуль", "Цель", "Копия / old / new (строки)", "copy~old", "copy~new", "old~new",
          "old→copy", "old→new", "Основа", "ДРЕЙФ"],
-        [(c["ext"], c["module_title"], c["target"],
+        [(c["ext"], c["module_title"], target_cell(c),
           "%s / %s / %s" % tuple("%d–%d" % tuple(x) if x else "—" for x in (c["copy_lines"], c["old_lines"],
                                                                           c["new_lines"])),
           c.get("ratio", {}).get("copy~old", "—"), c.get("ratio", {}).get("copy~new", "—"),
@@ -252,11 +285,15 @@ def render(cfg_new, cfg_old, exts, cases, args, elapsed):
         if "diff_old_copy" not in c:
             continue
         md.append("")
-        md.append("## %s — %s → %s" % (c["ext"], c["module_title"], c["target"]))
+        md.append("## %s — %s → %s" % (c["ext"], c["module_title"], target_cell(c)))
         md.append("")
         md.append("Копия `%s` %s:%d–%d; old %d–%d; new %d–%d." % (
             c["copy_method"], c["module"], c["copy_lines"][0], c["copy_lines"][1], c["old_lines"][0],
             c["old_lines"][1], c["new_lines"][0], c["new_lines"][1]))
+        if c.get("binding") == "callType":
+            md.append("")
+            md.append("Привязка: `%s` %s.%s, %s:%d." % (CALLTYPE_KIND, c["owner"], c["event"], c["form"],
+                                                         c["xml_line"]))
         for title, key, la, lb in (("old → копия (правки автора и более старая основа)", "diff_old_copy", "old", "copy"),
                                    ("old → new (изменения вендора)", "diff_old_new", "old", "new"),
                                    ("копия → new (что сводить при переносе)", "diff_copy_new", "copy", "new")):
@@ -282,7 +319,7 @@ def render(cfg_new, cfg_old, exts, cases, args, elapsed):
 
 def main(argv=None):
     fileio.console_utf8()
-    ap = argparse.ArgumentParser(description="Frozen &Вместо copies against base old and new")
+    ap = argparse.ArgumentParser(description="Frozen &Вместо and callType=Override copies against base old and new")
     ap.add_argument("--ext-root", action="extend", nargs="+", required=True)
     ap.add_argument("--ext", action="extend", nargs="+")
     ap.add_argument("--skip", action="extend", nargs="+")
@@ -302,7 +339,8 @@ def main(argv=None):
         "config_new": cfg_new.root, "config_old": cfg_old.root, "code_only": args.code_only, "cases": cases})
     print("extensions: %d, copies: %d, %.1fs" % (len(exts), len(cases), elapsed))
     for c in cases:
-        print("  %-40s %-45s %s" % (c["ext"][:40], c["target"][:45], BASIS.get(c.get("basis"), c.get("note"))))
+        print("  %-40s %-45s %s%s" % (c["ext"][:40], c["target"][:45], BASIS.get(c.get("basis"), c.get("note")),
+                                      " [callType %s]" % c["copy_method"] if c.get("binding") == "callType" else ""))
     print(md_path)
     print(json_path)
 

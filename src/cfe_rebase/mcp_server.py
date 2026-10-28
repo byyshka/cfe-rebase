@@ -599,8 +599,11 @@ def method_diff(ext: str | None = None, old: str | None = None, new: str | None 
     ответа — разрешённые пути, ext_newest — время самого нового файла выгрузки расширений.
 
     items — по объекту на метод вендора: module (путь внутри выгрузки), module_title, target, interceptors (ext, kind,
-    method, proceed, line — строка аннотации в модуле расширения), status: changed | unchanged | other, detail (текст
-    статуса, в т.ч. «только комментарии — контроль &ИзменениеИКонтроль всё равно ломается»), view (контроль | код),
+    method, proceed, line — строка аннотации в модуле расширения; у обработчика формы, заменённого в Form.xml с
+    `callType="Override"` без ПродолжитьВызов, kind «Вместо (callType)», line — строка объявления метода,
+    form / xml_line — привязка, event — элемент.событие; target — обработчик события в форме вендора, target_old — в
+    old, если вендор перепривязал событие), status: changed | unchanged | other, detail (текст статуса, в т.ч.
+    «только комментарии — контроль &ИзменениеИКонтроль всё равно ломается»), view (контроль | код),
     hunk_count, hunk_lines (изменённых строк), sig_changed (sig_old / sig_new — только если изменилась),
     body_extracted {old_lines, new_lines, new_calls} — вендор вынес тело (BODY_EXTRACTED: new на 75 % короче и вызывает
     метод, которого old не вызывал; копию &Вместо не сливать, а перенести правку автора на тело new), old_path /
@@ -627,7 +630,8 @@ def method_diff(ext: str | None = None, old: str | None = None, new: str | None 
         for g in data["methods"]:
             st = "changed" if g["hunks"] else ("unchanged" if g["status"] == "тело не изменилось" else "other")
             status[st] += 1
-            it = {"module": g["module"], "module_title": g["module_title"], "target": g["target"], "status": st,
+            it = {"module": g["module"], "module_title": g["module_title"], "target": g["target"],
+                  "target_old": g.get("target_old"), "status": st,
                   "detail": None if st == "unchanged" else g["status"], "view": g.get("view"),
                   "hunk_count": len(g["hunks"]),
                   "hunk_lines": sum(len(h["old"]) + len(h["new"]) for h in g["hunks"]),
@@ -1256,7 +1260,10 @@ def check_copies(ext_root: list[str] | None = None, config_old: str | None = Non
                  registry: str | None = None) -> dict[str, Any]:
     """Копии `&Вместо` без ПродолжитьВызов против тела вендора old и new (`bodies`): перенесена ли каждая копия на
     новый релиз. Для рабочей копии перед загрузкой — передать её как ext_root (check_control делает то же для
-    `&ИзменениеИКонтроль`).
+    `&ИзменениеИКонтроль`). Копия — и обработчик события заимствованной формы, назначенный в Form.xml расширения с
+    `callType="Override"` без ПродолжитьВызов: он так же заменяет обработчик вендора (kind «Вместо (callType)», target —
+    обработчик события в форме вендора, owner / event / form / xml_line — привязка; собственные элементы и команды
+    расширения, Before / After и события без обработчика вендора в обоих релизах — не копии).
 
     ext_root — папки с выгрузками расширений; config_old / config_new — выгрузки типовой; skip — имена расширений,
     которые пропустить; code_only (по умолчанию да) — сравнивать без комментариев.
@@ -1266,11 +1273,14 @@ def check_copies(ext_root: list[str] | None = None, config_old: str | None = Non
     Условие приёмки — result pass: основа копии перенесена на new (basis new — все изменения вендора old→new в копии,
     same-new — копия равна new) или каждое изменение вендора old→new уже в копии (vendor_in_copy = vendor_hunks, в том
     числе 0 — вендор тело не менял); иначе fail. items — по копии: ext, module_title, target, copy_method, result,
-    basis, vendor_hunks, vendor_in_copy; у fail ещё path (модуль расширения) + copy_lines, basis (new | mixed — часть изменений вендора в копии, часть нет | old —
+    basis, vendor_hunks, vendor_in_copy, kind (только у callType-копии);
+    у fail ещё path (модуль расширения) + copy_lines, basis (new | mixed — часть изменений вендора в копии, часть нет | old —
     копия old + правки | older — старше old или переписана | same-old | same-new) и basis_text, vendor_hunks,
     drift_hunks, ratio {copy~old, copy~new, old~new}, old_path / old_lines и new_path / new_lines — тело вендора, missing —
     изменения вендора, которых в копии нет: class, old / new — диапазоны строк в модулях old / new; note — базового
-    метода нет в old или new. summary — copies, pass, fail, счёт basis. Сами диффы — report.md / report.json."""
+    метода нет в old или new; у callType-копии ещё owner, event, form / xml_line — строка привязки, target_old —
+    обработчик в old, если вендор перепривязал событие. summary — copies, pass, fail, счёт basis, calltype — из них
+    callType-копий. Сами диффы — report.md / report.json."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
               "code_only": code_only, "db": db, "to": to, "from_release": from_release, "registry": registry}
 
@@ -1296,14 +1306,17 @@ def check_copies(ext_root: list[str] | None = None, config_old: str | None = Non
             ok = b is not None and (b in bodies.PORTED or c["vendor_in_copy"] == c["vendor_hunks"])
             it = {"ext": c["ext"], "module_title": c["module_title"], "path": _join(roots.get(c["ext"]), c["module"]),
                   "copy_lines": c["copy_lines"], "target": c["target"], "copy_method": c["copy_method"],
-                  "result": "pass" if ok else "fail", "basis": b, "basis_text": bodies.BASIS.get(b),
+                  "kind": c.get("kind"), "result": "pass" if ok else "fail", "basis": b,
+                  "basis_text": bodies.BASIS.get(b), "target_old": c.get("target_old"), "owner": c.get("owner"),
+                  "event": c.get("event"), "form": _join(roots.get(c["ext"]), c["form"]) if c.get("form") else None,
+                  "xml_line": c.get("xml_line"),
                   "note": c.get("note"), "vendor_hunks": c.get("vendor_hunks"),
                   "vendor_in_copy": c.get("vendor_in_copy"), "drift_hunks": c.get("drift_hunks"),
                   "ratio": c.get("ratio"),
                   "old_path": _join(config_old, c["module"]) if c["old_lines"] else None, "old_lines": c["old_lines"],
                   "new_path": _join(config_new, c["module"]) if c["new_lines"] else None, "new_lines": c["new_lines"]}
             if ok:  # a passed copy: what it is and why it passed; places and ratios are in the report
-                it = {k: it[k] for k in ("ext", "module_title", "target", "copy_method", "result", "basis",
+                it = {k: it[k] for k in ("ext", "module_title", "target", "copy_method", "kind", "result", "basis",
                                          "vendor_hunks", "vendor_in_copy")}
             else:
                 it["missing"] = [{"class": h["class"], "old": _hunk_span(h["old"]), "new": _hunk_span(h["new"])}
@@ -1311,7 +1324,8 @@ def check_copies(ext_root: list[str] | None = None, config_old: str | None = Non
             items.append(_compact(it))
         passed = sum(1 for it in items if it["result"] == "pass")
         summary = {"copies": len(items), "pass": passed, "fail": len(items) - passed,
-                   "basis": dict(sorted(basis.items())), "extensions": len(roots)}
+                   "basis": dict(sorted(basis.items())), "extensions": len(roots),
+                   "calltype": sum(1 for c in data["cases"] if c.get("binding") == "callType")}
         return {"summary": summary, "items": items, "report": _report(dest, "bodies")}
 
     return _execute("check_copies", inputs, lambda: _take_dict(inputs, "ext_root", "config_old", "config_new"), body,
@@ -1633,8 +1647,9 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
 
     summary — экран prepare: db, from, to, ext, ext_newest, dumped, work (path, state created | existing, commit,
     compared), verdicts control_rebase, interceptors (rows, flagged, flags), calls (findings — с флагами, flags),
-    queries (findings, unjudged), bodies (copies, vendor_changed), borrowed (findings, checks), registers (findings), plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько
-    находок скрыто как шум). items — пункты MUST_FIX плана: ext, module, module_title, method, what (что произошло и что
+    queries (findings, unjudged), bodies (copies, vendor_changed, calltype — из них копий callType=Override),
+    borrowed (findings, checks), registers (findings), plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько находок
+    скрыто как шум). items — пункты MUST_FIX плана: ext, module, module_title, method, what (что произошло и что
     делать). План не покрывает собственные копии СКД и макетов вендора под другим именем и запись в регистры через
     ЗаполнитьЗначенияСвойств или структуру — их сверять по тексту. report — json (prepare.json), plan {json, md} и
     {json, md} каждого из семи отчётов. Ошибки: bad_input (до любого запуска) — реестр, релиз, рабочая копия без git

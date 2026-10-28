@@ -3,14 +3,14 @@
 
 One item per extension + module + method (or call site / query place), grouped:
   MUST_FIX - what the update broke or changed under the extension: a rebased or conflicting &ИзменениеИКонтроль, an
-             &Вместо copy whose vendor original changed, a signature that no longer matches, a removed base method, a
-             call or a query that worked in old and does not in new, adopted metadata the vendor removed or retyped, a
-             dynamic list of an adopted form whose new query drops a field of the extension, a register write that
-             misses a new dimension, uses a dimension the vendor made a resource or an attribute, or goes to a
-             register the vendor removed, an interceptor or a call of a method the vendor made obsolete in this
-             release (TARGET_DEPRECATED / TARGET_UNCALLED, CALLS_DEPRECATED), a call into a module of an adopted
-             object the vendor removed or renamed, the extension's own method there included (OWNER_REMOVED /
-             OWNER_RENAMED);
+             &Вместо copy (or a form handler replaced by callType="Override") whose vendor original changed, a
+             signature that no longer matches, a removed base method, a call or a query that worked in old and does
+             not in new, adopted metadata the vendor removed or retyped, a dynamic list of an adopted form whose new
+             query drops a field of the extension, a register write that misses a new dimension, uses a dimension
+             the vendor made a resource or an attribute, or goes to a register the vendor removed, an interceptor or
+             a call of a method the vendor made obsolete in this release (TARGET_DEPRECATED / TARGET_UNCALLED,
+             CALLS_DEPRECATED), a call into a module of an adopted object the vendor removed or renamed, the
+             extension's own method there included (OWNER_REMOVED / OWNER_RENAMED);
   REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either),
              and MUST_FIX items in code nothing live calls (no references, or references only from such code);
   CLARIFY  - questions of design: the same target in several extensions, a base method new in this release, an
@@ -95,17 +95,22 @@ def _bodies(p, bodies):
     for c in bodies.get("cases", []):
         note = c.get("note") or ""
         args = (c["ext"], c["module"], c["copy_method"])
+        # a form handler replaced by callType="Override" in Form.xml is the same frozen copy, bound in the XML
+        calltype = c.get("binding") == "callType"
+        what, port = "копия &Вместо", "port_replace / merge-copy"
+        if calltype:
+            what = "копия Вместо (callType %s.%s → %s)" % (c.get("owner"), c.get("event"), c["target"])
+            port = "port_replace с copy_method=%s / merge-copy --copy-method" % c["copy_method"]
         if note:
             if "new" in note and "old и new" not in note:
-                p.add("MUST_FIX", *args, "копия &Вместо: " + note, "bodies:" + note, c.get("module_title"))
+                p.add("MUST_FIX", *args, what + ": " + note, "bodies:" + note, c.get("module_title"))
             else:
-                p.add("CLARIFY", *args, "копия &Вместо: " + note, "bodies:" + note, c.get("module_title"))
+                p.add("CLARIFY", *args, what + ": " + note, "bodies:" + note, c.get("module_title"))
             continue
         change = (c.get("change") or {}).get("old->new", "=")
         if change != "=":
-            p.add("MUST_FIX", *args, "копия &Вместо: вендор изменил оригинал (old→new %s) — перенести копию "
-                                     "(port_replace / merge-copy)" % change, "bodies:vendor_changed",
-                  c.get("module_title"))
+            p.add("MUST_FIX", *args, "%s: вендор изменил оригинал (old→new %s) — перенести копию (%s)" % (
+                what, change, port), "bodies:vendor_changed", c.get("module_title"))
         else:
             p.hide("bodies:оригинал копии не менялся")
 
