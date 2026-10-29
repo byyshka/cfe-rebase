@@ -5,17 +5,20 @@ One item per extension + module + method (or call site / query place), grouped:
   MUST_FIX - what the update broke or changed under the extension: a rebased or conflicting &ИзменениеИКонтроль, an
              &Вместо copy (or a form handler replaced by callType="Override") whose vendor original changed, a
              signature that no longer matches, a removed base method, a call or a query that worked in old and does
-             not in new, adopted metadata the vendor removed or retyped, a dynamic list of an adopted form whose new
-             query drops a field of the extension, a register write that misses a new dimension, uses a dimension
-             the vendor made a resource or an attribute, or goes to a register the vendor removed, an interceptor or
-             a call of a method the vendor made obsolete in this release (TARGET_DEPRECATED, CALLS_DEPRECATED), an
-             interceptor of a method the vendor code stopped calling on all paths (TARGET_UNCALLED) or on some of a
+             not in new, adopted metadata the vendor removed or retyped or whose controlled property it changed, a
+             dynamic list of an adopted form whose new query drops a field of the extension, a register write that
+             misses a new dimension, uses a dimension the vendor made a resource or an attribute, or goes to a register
+             the vendor removed, an interceptor or a call of a method the vendor made obsolete in this release
+             (TARGET_DEPRECATED, CALLS_DEPRECATED), an interceptor of a method the vendor code stopped calling on all
+             paths (TARGET_UNCALLED) or on some of a
              few, through a vendor method that is still there (CALLERS_LOST, at most FEW_CALLERS callers in old), a
              call into a module of an adopted object the vendor removed or renamed, the extension's own method there
              included (OWNER_REMOVED / OWNER_RENAMED), a dynamic list whose query the extension replaces without a
-             field the new vendor form needs (names: LIST_QUERY_FIELD_MISSING);
+             field the new vendor form needs (names: LIST_QUERY_FIELD_MISSING), an object module of the extension
+             that reads a field the vendor added in new without adopting it (names: FIELD_NOT_ADOPTED), a
+             CompatibilityMode of the extension that differs from new (borrowed: COMPAT_MODE);
   REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either, a
-             list field the old vendor form needed as well),
+             list field the old vendor form needed as well, a field read without adoption that old had too),
              and MUST_FIX items in code nothing live calls (no references, or references only from such code);
   CLARIFY  - questions of design: the same target in several extensions, CALLERS_LOST of a method with many vendor
              callers or lost only with the vendor methods that called it, a base method new in this release, an
@@ -232,8 +235,9 @@ def _borrowed(p, borrowed):
         what = f["detail"] + ("; формы расширения с этим полем: " + ", ".join(f["forms"]) if f.get("forms") else "")
         # an XML that does not parse is not judged: the file is to be looked at, not the adoption fixed
         group = "CLARIFY" if f["check"] in ("NOT_IN_VENDOR", "XML_UNREADABLE") else "MUST_FIX"
-        p.add(group, f["ext"], f["file"], None, "заимствование %s: %s" % (f["object"], what), "borrowed:" + f["check"],
-              f["object"])
+        # the extension's own Configuration.xml is not an adoption of a vendor object
+        head = "расширение" if f["check"] == "COMPAT_MODE" else "заимствование %s" % f["object"]
+        p.add(group, f["ext"], f["file"], None, "%s: %s" % (head, what), "borrowed:" + f["check"], f["object"])
 
 
 def _registers(p, registers):
@@ -251,11 +255,14 @@ def _registers(p, registers):
               "запись в регистр " + f["detail"], "registers:" + kind, f.get("module_title"))
 
 
+NAMES_IN_PLAN = ("LIST_QUERY_FIELD_MISSING", "LIST_FIELD_NOT_LOADED", "FIELD_NOT_ADOPTED")
+
+
 def _names(p, names):
-    """Only LIST_QUERY_FIELD_MISSING and LIST_FIELD_NOT_LOADED of the names report: the other names checks are not in
-    the plan."""
+    """Only LIST_QUERY_FIELD_MISSING, LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED of the names report: the other names
+    checks are not in the plan."""
     for f in (names or {}).get("findings", []):
-        if f.get("check") not in ("LIST_QUERY_FIELD_MISSING", "LIST_FIELD_NOT_LOADED"):
+        if f.get("check") not in NAMES_IN_PLAN:
             continue
         method = (f.get("methods") or [None])[0]
         if f["check"] == "LIST_FIELD_NOT_LOADED":
@@ -270,8 +277,8 @@ def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None, names
     then extension and module. A MUST_FIX item in code no extension calls (UNBOUND, or a caller without references)
     goes to REVIEW with a note; so does one whose method is referenced only from such code (refs.liveness: the
     caller_live of calls, the method_live of queries and registers). borrowed - the report of borrowed.py (adopted metadata against new), registers - of
-    registers.py (writes to registers whose structure changed), names - of names.py (only LIST_QUERY_FIELD_MISSING and
-    LIST_FIELD_NOT_LOADED are taken); all three optional."""
+    registers.py (writes to registers whose structure changed), names - of names.py (only LIST_QUERY_FIELD_MISSING,
+    LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED are taken); all three optional."""
     p = Plan()
     _control(p, ctl)
     _bodies(p, bodies)

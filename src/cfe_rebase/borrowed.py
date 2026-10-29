@@ -28,6 +28,23 @@ section attribute whose type (with string length and number digits) the extensio
                   named in the detail: the merge has to carry them over)
   XML_UNREADABLE  the XML of the object exists but does not parse - in new, in old or in the extension: the object is
                   not checked (this is not OBJECT_REMOVED), the detail names the file and the parser error
+  COMPAT_MODE     <CompatibilityMode> in Configuration.xml of the extension differs from the one of new: the platform
+                  refuses the load («Значение контролируемого свойства РежимСовместимости у объекта  не совпадает со
+                  значением в расширяемой конфигурации», a real load: 8_3_24 of 11.5.17 against 8_3_27 of 11.5.27).
+                  An extension without the property is not checked; ConfigurationExtensionCompatibilityMode is not
+                  compared (the platform took 8_3_21 under 8_3_27 there)
+  PROPERTY_CHANGED a controlled property of an adopted object (its <Properties>, of an adopted form, template or
+                  command too; CompatibilityMode of the extension's Configuration.xml is COMPAT_MODE) holds the vendor's value of
+                  old and the vendor changed it in new: the platform refuses the extension («Значение контролируемого
+                  свойства Хранение у объекта ФункциональнаяОпция.X не совпадает со значением в расширяемой
+                  конфигурации»); a new value that names an object the extension does not have gets a cfe-borrow hint
+Controlled properties: an adopted object holds, besides its identity (ObjectBelonging, Name, Comment,
+ExtendedConfigurationObject), only properties the platform either controls (it copied the vendor's value at borrowing
+and checks it when it applies the extension) or lets the extension change (ITS «Расширения конфигураций», «Устройство»:
+a property is either controlled or modified, never both). The ones the extension changes are NOT_CONTROLLED below; a
+property the extension holds with a value other than old's is its own value and is not reported either, except
+PROVEN_CONTROLLED (named by the platform's refusal of a real load).
+
 An adopted form without <ExtendedConfigurationObject> is not a finding: checked on 17.10.2026 on a real base
 (platform 8.3.27), such a form loaded from XML applies like one with the link (0.2.5 reported it, 0.2.6 does not).
 Names are compared case-insensitively, as 1C does: a vendor rename that changes only the case is not REMOVED.
@@ -41,6 +58,7 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from collections import Counter
 
 from . import fileio, metadata
@@ -61,7 +79,47 @@ EXPLAIN = {
     "LIST_FIELD_LOST": "новый запрос динамического списка заимствованной формы не выбирает поле расширения",
     "LIST_CHANGED": "список заимствованной формы изменили и вендор, и расширение",
     "XML_UNREADABLE": "XML объекта (в new, old или расширении) не разбирается: объект не проверен, это не удаление",
+    "COMPAT_MODE": "режим совместимости (CompatibilityMode) в Configuration.xml расширения не совпадает с new",
+    "PROPERTY_CHANGED": "контролируемое свойство заимствованного объекта: в расширении значение old, вендор сменил его "
+                        "в new — платформа расширение не применит",
 }
+
+# properties of an adopted object that are not controlled. Identity: the extension's own. Extended: the extension's
+# additions to the vendor's list (the corpora hold only the extension's registers, subsystem content items, filter
+# criterion types and content - values other than old's, loaded into old). Modified: the extension's value replaces
+# the vendor's (Synonym, ObjectPresentation and MainDataCompositionSchema hold the extension's value in real
+# corpora, loaded); the presentations, Explanation and the main forms are taken by analogy - not proven by a load
+IDENTITY_PROPS = {"ObjectBelonging", "Name", "Comment", "ExtendedConfigurationObject"}
+NOT_CONTROLLED = {"RegisterRecords", "Content", "Synonym", "ObjectPresentation", "ExtendedObjectPresentation",
+                  "ListPresentation", "ExtendedListPresentation", "Explanation", "MainDataCompositionSchema",
+                  "DefaultObjectForm", "DefaultListForm", "DefaultChoiceForm", "DefaultFolderForm",
+                  "DefaultFolderChoiceForm", "DefaultRecordForm", "DefaultForm", "DefaultSettingsForm",
+                  "DefaultVariantForm", "AuxiliaryObjectForm", "AuxiliaryListForm", "AuxiliaryChoiceForm",
+                  "AuxiliaryFolderForm", "AuxiliaryFolderChoiceForm", "AuxiliaryRecordForm", "AuxiliaryForm",
+                  "AuxiliarySettingsForm", "AuxiliaryVariantForm"}
+# extended in a filter criterion only: Type there lists the extension's added types
+NOT_CONTROLLED_OF = {"FilterCriterion": {"Type"}}
+# controlled whatever the extension's value against old: named by the platform's refusal (a real load)
+PROVEN_CONTROLLED = {("FunctionalOption", "Location")}
+# Russian names of the properties as the platform's message and the syntax reference name them (display only)
+PROP_RU = {"Location": "Хранение", "CompatibilityMode": "РежимСовместимости", "Type": "Тип",
+           "InformationRegisterPeriodicity": "ПериодичностьРегистраСведений", "WriteMode": "РежимЗаписи",
+           "RegisterType": "ВидРегистра", "Category": "Категория", "Group": "Группа", "HierarchyType": "ВидИерархии",
+           "CodeLength": "ДлинаКода", "CodeType": "ТипКода", "CodeAllowedLength": "ДопустимаяДлинаКода",
+           "DescriptionLength": "ДлинаНаименования", "Hierarchical": "Иерархический", "Owners": "Владельцы",
+           "NumberType": "ТипНомера", "NumberLength": "ДлинаНомера", "NumberAllowedLength": "ДопустимаяДлинаНомера",
+           "FormType": "ТипФормы", "TemplateType": "ТипМакета", "LanguageCode": "КодЯзыка", "Task": "Задача",
+           "Global": "Глобальный", "Server": "Сервер", "ServerCall": "ВызовСервера",
+           "ExternalConnection": "ВнешнееСоединение", "ClientManagedApplication": "КлиентУправляемоеПриложение",
+           "ClientOrdinaryApplication": "КлиентОбычноеПриложение"}
+# kinds outside metadata.KINDS whose adopted objects carry controlled properties (the corpora: StyleItem Type,
+# CommandGroup Category, CommonAttribute Type, Language LanguageCode, XDTOPackage Namespace)
+EXTRA_KINDS = {"StyleItems": "ЭлементСтиля", "CommandGroups": "ГруппаКоманд", "CommonAttributes": "ОбщийРеквизит",
+               "Languages": "Язык", "XDTOPackages": "ПакетXDTO", "CommonPictures": "ОбщаяКартинка",
+               "Styles": "Стиль", "FunctionalOptionsParameters": "ПараметрФункциональныхОпций",
+               "Interfaces": "Интерфейс", "WSReferences": "WSСсылка", "Bots": "Бот",
+               "IntegrationServices": "СервисИнтеграции", "ExternalDataSources": "ВнешнийИсточникДанных"}
+REF_RE = re.compile(r"^([A-Za-z]+)\.([^.\s]+)$")
 
 
 def _short(key):
@@ -236,6 +294,114 @@ def check_form_lists(ext, kind, name, form, cfg_old, cfg_new, ported=None):
     return out
 
 
+def _canon(el):
+    """A property value comparable across dumps: tag, attributes, text and the children as a multiset (the vendor
+    reorders the items of a list, the types of a composite type)."""
+    kids = sorted(_canon(c) for c in el)
+    return "%s%s=%s[%s]" % (el.tag, sorted(el.attrib.items()), (el.text or "").strip(), ",".join(kids))
+
+
+def _show(el):
+    """A property value for a person: its text, or the texts inside it."""
+    if el is None:
+        return "—"
+    texts = [(c.text or "").strip() for c in el.iter() if (c.text or "").strip()]
+    out = ", ".join(texts) or "пусто"
+    return out if len(out) <= 200 else out[:200] + "…"
+
+
+def _properties(path, child=None):
+    """<Properties> of the object in path (child: (tag, name) of an element of its ChildObjects); None when the file is
+    absent, does not parse or has no such element."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return None
+    obj = next(iter(root), None)
+    if obj is None:
+        return None
+    if child is not None:
+        co = obj.find(metadata.MD + "ChildObjects")
+        hit = None
+        for el in co.findall(metadata.MD + child[0]) if co is not None else []:
+            nm = el.findtext(metadata.MD + "Properties/" + metadata.MD + "Name") or ""
+            if nm.strip().casefold() == child[1].casefold():
+                hit = el
+                break
+        obj = hit
+    return obj.find(metadata.MD + "Properties") if obj is not None else None
+
+
+def _kind_tag(path):
+    """The element name of the object in path (FunctionalOption, Form, Template, Configuration)."""
+    try:
+        obj = next(iter(ET.parse(path).getroot()), None)
+    except (ET.ParseError, OSError):
+        return None
+    return obj.tag.rsplit("}", 1)[-1] if obj is not None else None
+
+
+def _same_value(tag, a_props, b_props):
+    a, b = a_props.find(metadata.MD + tag), b_props.find(metadata.MD + tag)
+    if tag == "Type" and a is not None and b is not None and \
+            any(c.tag in (metadata.V8 + "Type", metadata.V8 + "TypeSet") for c in list(a) + list(b)):
+        return _same_type(metadata.type_key(a_props), metadata.type_key(b_props))
+    return _canon(a) == _canon(b)
+
+
+EN2RU = {v: k for k, v in metadata.KIND_TAGS.items()}
+
+
+def _missing_ref(ext, value):
+    """«Constant.X» named by a new value that the extension does not have: (EN kind, name, RU title), else None."""
+    m = REF_RE.match(value or "")
+    if not m or m.group(1) not in EN2RU:
+        return None
+    ru = EN2RU[m.group(1)]
+    if ext.object_exists(ru, m.group(2)):
+        return None
+    return m.group(1), m.group(2), "%s.%s" % (ru, m.group(2))
+
+
+def check_properties(ext, base, kind_tag, ext_path, old_path, new_path, child=None, sub=None):
+    """PROPERTY_CHANGED findings of one adopted object, form, template or command: a controlled property whose value
+    in the extension is the vendor's old one (or any value, for PROVEN_CONTROLLED) and differs from new. kind_tag -
+    the element name (FunctionalOption, Form, Command, …); child - (tag, name) of an element of ChildObjects; sub -
+    (part, name) of a form, template or command of the object, named in part and detail."""
+    mine = _properties(ext_path, child)
+    theirs = _properties(new_path, child)
+    if mine is None or theirs is None:
+        return []
+    before = _properties(old_path, child) if old_path else None
+    skip = IDENTITY_PROPS | NOT_CONTROLLED | NOT_CONTROLLED_OF.get(kind_tag, set())
+    out = []
+    for el in mine:
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag in skip or theirs.find(metadata.MD + tag) is None or _same_value(tag, mine, theirs):
+            continue
+        proven = (kind_tag, tag) in PROVEN_CONTROLLED
+        was = before.find(metadata.MD + tag) if before is not None else None
+        # a value other than old's is the extension's own (a type placeholder of a composite type, an extended one)
+        if not proven and (was is None or not _same_value(tag, mine, before)):
+            continue
+        if tag == "Type" and _widened(metadata.type_key(mine), metadata.type_key(theirs)):
+            continue  # the vendor only added types: accepted, as for attributes (ОснованияЗапросаКоммерческих…, a real case)
+        new_el = theirs.find(metadata.MD + tag)
+        name = "%s (%s)" % (PROP_RU[tag], tag) if tag in PROP_RU else tag
+        where = "%s %s: " % sub if sub else ""
+        detail = "%sконтролируемое свойство %s: в расширении %s, в new %s%s — поставить значение new" % (
+            where, name, _show(el), _show(new_el),
+            "" if was is None or _same_value(tag, mine, before) else " (и с old %s не совпадало)" % _show(was))
+        ref = _missing_ref(ext, (new_el.text or "").strip())
+        if ref:
+            detail += "; %s в расширении нет — заимствовать: cfe-borrow -Object \"%s.%s\"" % (ref[2], ref[0], ref[1])
+        out.append(dict(base, part="свойство" + (" %s %s" % sub if sub else ""), name=tag,
+                        check="PROPERTY_CHANGED", detail=detail, value=_show(el), new_value=_show(new_el)))
+    return out
+
+
 def _folded(children):
     """{casefolded name: info} of one child collection: 1C names are case-insensitive, and the vendor may change only
     the case of a name between releases. Each info gets the name as written ("name")."""
@@ -375,7 +541,51 @@ def check_object(ext, kind, name, cfg_old, cfg_new, ported=None):
                                                                       done))
                 if ported is not None:
                     ported.extend("%s.%s" % (title, x) for x in done)
+    found.extend(_object_properties(ext, kind, name, o, base, cfg_old, old_name, cfg_new, new_name))
     return found
+
+
+def check_compat(ext, cfg_new):
+    """COMPAT_MODE of one extension, or None: its <CompatibilityMode> is controlled against the configuration it
+    extends. Compared only when both have the property; the values are enum names (Version8_3_27), compared as is."""
+    if not ext.compat or not cfg_new.compat or ext.compat == cfg_new.compat:
+        return None
+    return {"ext": ext.name, "object": "Конфигурация." + ext.name, "file": "Configuration.xml", "part": "свойство",
+            "name": "CompatibilityMode", "check": "COMPAT_MODE", "ext_value": ext.compat, "new_value": cfg_new.compat,
+            "detail": "режим совместимости расширения %s, у new — %s%s: платформа откажет в загрузке («Значение "
+                      "контролируемого свойства РежимСовместимости … не совпадает со значением в расширяемой "
+                      "конфигурации») — заменить в Configuration.xml расширения <CompatibilityMode>%s</CompatibilityMode>"
+                      " на %s; ConfigurationExtensionCompatibilityMode не трогать" % (
+                          ext.compat, cfg_new.compat, " (свойство на контроле: %s)" % ext.compat_state
+                          if ext.compat_state else "", ext.compat, cfg_new.compat)}
+def _object_properties(ext, kind, name, o, base, cfg_old, old_name, cfg_new, new_name):
+    """PROPERTY_CHANGED of an adopted object, of its adopted forms and templates (Forms/<X>.xml, Templates/<X>.xml)
+    and of its adopted commands."""
+    paths = (o.path, cfg_old.object_path(kind, old_name) if cfg_old is not None else None,
+             cfg_new.object_path(kind, new_name))
+    out = check_properties(ext, base, metadata.KIND_TAGS[kind], *paths)
+    for bucket, folder, part, tag in (("forms", "Forms", "формы", "Form"),
+                                      ("templates", "Templates", "макета", "Template")):
+        for child in sorted(o.adopted_names(bucket)):
+            original = next((x for x in getattr(o, bucket) if x.casefold() == child), child)
+            sub_paths = [os.path.join(os.path.splitext(p)[0], folder, original + ".xml") if p else None for p in paths]
+            out.extend(check_properties(ext, base, tag, *sub_paths, sub=(part, original)))
+    for command in sorted(o.commands_adopted):
+        out.extend(check_properties(ext, base, "Command", *paths, child=("Command", command),
+                                    sub=("команды", command)))
+    return out
+
+
+def check_extra(ext, folder, name, cfg_old, cfg_new):
+    """PROPERTY_CHANGED of an adopted object of a kind outside metadata.KINDS (EXTRA_KINDS: style items, command
+    groups, common attributes, languages, XDTO packages, …), looked up in old and new by the same file name."""
+    rel = "%s/%s.xml" % (folder, name)
+    paths = [os.path.join(d.root, folder, name + ".xml") if d is not None else None for d in (ext, cfg_old, cfg_new)]
+    head = fileio.read_text(paths[0])[:6000] if os.path.isfile(paths[0]) else ""
+    if "<ObjectBelonging>Adopted</ObjectBelonging>" not in head:
+        return []
+    base = {"ext": ext.name, "object": "%s.%s" % (EXTRA_KINDS[folder], name), "file": rel}
+    return check_properties(ext, base, _kind_tag(paths[0]), *paths)
 
 
 def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None, ported=None):
@@ -384,6 +594,9 @@ def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None, ported=None):
     findings, stats = [], Counter()
     ported = [] if ported is None else ported
     for ext in exts:
+        compat = check_compat(ext, cfg_new)
+        if compat is not None:
+            findings.append(compat)
         for kind, (folder, _, _) in sorted(metadata.KINDS.items()):
             root = os.path.join(ext.root, folder)
             if not os.path.isdir(root):
@@ -398,6 +611,11 @@ def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None, ported=None):
                 if ext.object(kind, f[:-4]) is not None and ext.object(kind, f[:-4]).adopted:
                     stats["adopted"] += 1
                 findings.extend(res)
+        for folder in sorted(EXTRA_KINDS):
+            root = os.path.join(ext.root, folder)
+            for f in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+                if f.endswith(".xml"):
+                    findings.extend(check_extra(ext, folder, f[:-4], cfg_old, cfg_new))
     stats["unreadable"] = sum(1 for f in findings if f["check"] == "XML_UNREADABLE")
     stats["lists_ported"] = len(ported)
     return exts, findings, stats

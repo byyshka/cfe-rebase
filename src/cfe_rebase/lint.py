@@ -18,6 +18,14 @@ are compared under the new path - and .bsl modules that lost their BOM
 reported. A nonexistent --ext, or one without extension dumps, is refused; an extension of the work copy without a pair
 in --ext is named on the console and in stats (without_source, without_source_names). --only takes the name, folder
 or Configuration uuid of the work copy's extension or of its source in --ext (the work copy is usually renamed).
+The name of the extension (Name of its Configuration.xml) against the other files that carry it - a rename by
+cf-edit modify-property Name changes only Configuration.xml: a role's Rights.xml with <name>Configuration.<other
+name></name> is EXT_NAME_STALE (error: the platform refuses the load, «Неизвестный объект метаданных -
+Configuration.<old name>» once per role, a real load), ConfigDumpInfo.xml with name="Configuration.<other name>"
+(and its children Configuration.<other name>.ManagedApplicationModule, …) is EXT_NAME_STALE_DUMP_INFO (info: in the
+same real load 20 files carried the old name and the 19 refusals were all roles; another real load passed the
+check with a stale child entry, and the dump after the load wrote the new name there itself - to fix along, not
+proven harmless for a partial load or a dump with -update over the work copy).
 Lines are split on CR LF, LF and CR only, as the platform and fileio.read_lines count them. Nothing is written outside
 --out, and --out may not be inside --work or --ext.
 
@@ -37,7 +45,10 @@ from .control_rebase import cfg_uuid, inside, work_index
 
 TEXT_EXT = {".bsl", ".xml", ".txt", ".html", ".htm", ".json", ".css", ".js"}
 STRICT_EXT = {".bsl", ".xml"}  # the platform reads them as UTF-8: a byte that is not UTF-8 is an error
-INFO = {"OBJECT_REMOVED", "CHILD_REMOVED", "OBJECT_RENAMED"}
+INFO = {"OBJECT_REMOVED", "CHILD_REMOVED", "OBJECT_RENAMED", "EXT_NAME_STALE_DUMP_INFO"}
+# where the extension's own name is written besides Configuration.xml: «Configuration.<Имя>» and its children
+RIGHTS_CFG_RE = re.compile(r"<name>\s*Configuration\.([^<.\s]+)[^<]*</name>")
+DUMP_INFO_CFG_RE = re.compile(r'\bname="Configuration\.([^".\s]+)[^"]*"')
 # sub-object folder of an object -> (ChildObjects bucket of metadata.ObjectInfo, what the detail says)
 CHILD_DIRS = {"Forms": ("forms", "форма убрана"), "Templates": ("templates", "макет убран"),
               "Commands": ("commands", "команда убрана")}
@@ -79,6 +90,32 @@ def file_issues(rel, data):
     lines = text_lines(data)
     issues = structure.module_issues(lines) if rel.lower().endswith(".bsl") else structure.merge_markers(lines)
     return [{"file": rel, "check": c, "line": n, "detail": d} for c, n, d in issues]
+
+
+def name_issues(rel, data, name):
+    """EXT_NAME_STALE (a role's Rights.xml) / EXT_NAME_STALE_DUMP_INFO (ConfigDumpInfo.xml): «Configuration.X» where X
+    is not the extension's name - one finding per file, at the line of the first such reference; [] for other files."""
+    parts = rel.split("/")
+    if len(parts) == 4 and parts[0] == "Roles" and parts[2] == "Ext" and parts[3] == "Rights.xml":
+        check, rx, where = "EXT_NAME_STALE", RIGHTS_CFG_RE, "права роли на Configuration.%s"
+    elif rel == "ConfigDumpInfo.xml":
+        check, rx, where = "EXT_NAME_STALE_DUMP_INFO", DUMP_INFO_CFG_RE, "записи Configuration.%s"
+    else:
+        return []
+    text = text_of(data)
+    stale = [m for m in rx.finditer(text) if m.group(1).casefold() != name.casefold()]
+    if not stale:
+        return []
+    olds = sorted({m.group(1) for m in stale})
+    line = text.count("\n", 0, stale[0].start()) + 1
+    detail = "%s (ссылок: %d), а расширение называется %s (Name в Configuration.xml) — заменить Configuration.%s на " \
+             "Configuration.%s в этом файле" % (where % ", ".join(olds), len(stale), name, "/".join(olds), name)
+    if check == "EXT_NAME_STALE":
+        detail += "; иначе платформа откажет в загрузке: «Неизвестный объект метаданных - Configuration.%s»" % olds[0]
+    else:
+        detail += "; полная загрузка по ConfigDumpInfo.xml не отказывает, а выгрузка после неё пишет новое имя сама " \
+                  "(проверено на реальных загрузках) — поправить вместе с ролями, чтобы рабочая копия совпала с базой"
+    return [{"file": rel, "check": check, "line": line, "detail": detail, "old_name": olds[0], "new_name": name}]
 
 
 def eol(data):
@@ -242,7 +279,11 @@ def lint(work, ext=None, only=None):
                 continue
             stats["files"] += 1
             stats["modules"] += rel.lower().endswith(".bsl")
-            found.extend(file_issues(rel, fileio.read_bytes(p)))
+            data = fileio.read_bytes(p)
+            issues_of_file = file_issues(rel, data)
+            found.extend(issues_of_file)
+            if not any(x["check"] == "ENCODING" for x in issues_of_file):
+                found.extend(name_issues(rel, data, w.name))
         if src is not None:
             found.extend(compare(src.root, w.root, files(src.root), wf))
         for it in found:

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from cfe_rebase import names, selection
-from tests.unit.test_borrowed import HEAD, child, obj, write
+from tests.unit.test_borrowed import HEAD, child, obj, tabular, write
 
 FORM_HEAD = '<?xml version="1.0" encoding="UTF-8"?>\n<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" ' \
             'xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config"' \
@@ -169,6 +169,127 @@ class Names(unittest.TestCase):
                             'ЭтаФорма.Элементы.Д = 1; ЭтотОбъект.Е = 1; ЭтотОбъект.Ж(); Объект.З.И = 1;')
         self.assertEqual([(h, n) for h, n, _, _ in names.references(toks)],
                          [("items", "Д"), ("attribute", "Е"), ("object", "З")])
+
+
+# the object module of an adopted document: a real case 11.5.17 -> 11.5.27, РеализацияТоваровУслуг adopted with Основание
+# only; the Designer's module check said «Переменная не определена (ОснованиеНомер)» at 297 and (ОснованиеДата) at 304
+OBJ_MODULE = """Перем Организация;
+
+&После("ОбработкаПроверкиЗаполнения")
+Процедура Расш_ОбработкаПроверкиЗаполнения(Отказ, ПроверяемыеРеквизиты)
+	ШаблонСообщения = НСтр("ru = 'Не заполнено поле ""%1"" в реквизитах печати (вкладка ""Дополнительно"").'");
+	Если Не ЗначениеЗаполнено(Основание) Тогда
+		ОбщегоНазначения.СообщитьПользователю(ШаблонСообщения, ЭтотОбъект, "Основание", , Отказ);
+	КонецЕсли;
+	Если Не ЗначениеЗаполнено(ОснованиеНомер) Тогда
+		ОбщегоНазначения.СообщитьПользователю(ШаблонСообщения, ЭтотОбъект, "ОснованиеНомер", , Отказ);
+	КонецЕсли;
+	Если Не ЗначениеЗаполнено(ОснованиеДата) Тогда
+		ОбщегоНазначения.СообщитьПользователю(ШаблонСообщения, ЭтотОбъект, "ОснованиеДата", , Отказ);
+	КонецЕсли;
+	// Комментарий = Склад;
+	Если ЭтотОбъект.ОснованиеНомер = "" И Объект.Партнер = Неопределено Тогда
+		Возврат;
+	КонецЕсли;
+#Удаление
+	Сумма = Комментарий;
+#КонецУдаления
+КонецПроцедуры
+
+&Перед("ОбработкаЗаполнения")
+Процедура Расш_ОбработкаЗаполнения(ДанныеЗаполнения, Валюта, СтандартнаяОбработка)
+	Автор = ДанныеЗаполнения.Автор;
+	Если Не ЗначениеЗаполнено(Автор) Тогда
+		Автор = Неопределено;
+	КонецЕсли;
+	Если Не ЗначениеЗаполнено(Склад) Тогда
+		Склад = ДанныеЗаполнения.Склад;
+	КонецЕсли;
+	Для Каждого Контрагент Из ДанныеЗаполнения.Контрагенты Цикл
+		Партнер = Контрагент;
+	КонецЦикла;
+	Сумма = Валюта + Организация + Расходы.Итог("Сумма") + Новое;
+КонецПроцедуры
+"""
+
+
+class ObjectModuleFields(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cfe_names_obj_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        t = self.tmp
+        common = ["Основание", "ОснованиеНомер", "ОснованиеДата", "Автор", "Склад", "Контрагент", "Партнер",
+                  "Комментарий", "Валюта", "Организация"]
+        vendor = {"old": [child("Attribute", n) for n in common],
+                  "new": [child("Attribute", n) for n in common + ["Новое"]] + [tabular("Расходы", [])]}
+        for root, children in vendor.items():
+            write(os.path.join(t, root, "Configuration.xml"), HEAD + '<Configuration uuid="c-%s"><Properties><Name>'
+                  'Типовая</Name></Properties></Configuration></MetaDataObject>' % root)
+            write(os.path.join(t, root, "Documents", "Реализация.xml"), obj("Document", "Реализация", children))
+        ext = os.path.join(t, "ext", "Расш")
+        write(os.path.join(ext, "Configuration.xml"), HEAD + '<Configuration uuid="c-ext"><Properties><Name>Расш</Name>'
+              '<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>'
+              '</Configuration></MetaDataObject>')
+        write(os.path.join(ext, "Documents", "Реализация.xml"), obj("Document", "Реализация", [
+            child("Attribute", "Основание", adopted=True)], True))
+        write(os.path.join(ext, "Documents", "Реализация", "Ext", "ObjectModule.bsl"), OBJ_MODULE)
+        # a manager module has no object attributes in its context: not read
+        write(os.path.join(ext, "Documents", "Реализация", "Ext", "ManagerModule.bsl"),
+              "Функция Расш_Склад() Экспорт\n\tВозврат Склад;\nКонецФункции\n")
+        self.out = os.path.join(t, "out")
+
+    def run_tool(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            names.main(["--ext-root", os.path.join(self.tmp, "ext"), "--config-old", os.path.join(self.tmp, "old"),
+                        "--config-new", os.path.join(self.tmp, "new"), "--out", self.out])
+        with open(os.path.join(self.out, "names.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_reads_of_fields_not_adopted(self):
+        data = self.run_tool()
+        got = {f["name"]: (f["level"], f["lines"], f["methods"]) for f in data["findings"]}
+        self.assertEqual(got, {
+            "ОснованиеНомер": ("risk", [9], ["Расш_ОбработкаПроверкиЗаполнения"]),
+            "ОснованиеДата": ("risk", [12], ["Расш_ОбработкаПроверкиЗаполнения"]),
+            # read before its first assignment in the method: not yet a local variable for the Designer
+            "Склад": ("risk", [30], ["Расш_ОбработкаЗаполнения"]),
+            # the vendor added these in new: the reference came with the port
+            "Расходы": ("error", [36], ["Расш_ОбработкаЗаполнения"]),
+            "Новое": ("error", [36], ["Расш_ОбработкаЗаполнения"]),
+        })
+        f = next(f for f in data["findings"] if f["name"] == "ОснованиеНомер")
+        self.assertEqual((f["check"], f["how"], f["form"], f["module"]), (
+            "FIELD_NOT_ADOPTED", "module", "Документ.Реализация.МодульОбъекта",
+            "Documents/Реализация/Ext/ObjectModule.bsl"))
+        self.assertIn("Переменная не определена (ОснованиеНомер)", f["detail"])
+        self.assertIn("было и в old", f["detail"])
+        self.assertIn("ЭтотОбъект.ОснованиеНомер", f["detail"])
+        self.assertIn("пришло с переносом", next(f for f in data["findings"] if f["name"] == "Новое")["detail"])
+        self.assertEqual(data["stats"]["object_modules"], 1)
+        self.assertEqual(data["stats"]["object_module_this_unadopted"], 1)
+
+    def test_adopting_the_field_clears_it(self):
+        write(os.path.join(self.tmp, "ext", "Расш", "Documents", "Реализация.xml"), obj("Document", "Реализация", [
+            child("Attribute", n, adopted=True) for n in ("Основание", "ОснованиеНомер", "ОснованиеДата", "Склад",
+                                                           "Новое")] + [tabular("Расходы", [], True)], True))
+        self.assertEqual(self.run_tool()["findings"], [])
+
+    def test_in_plan_and_selection(self):
+        from cfe_rebase import plan
+        data = self.run_tool()
+        p = plan.build({"methods": []}, {"cases": []}, {"registry": [], "dead_code": {}}, {"findings": []},
+                       {"findings": []}, None, None, data)
+        self.assertEqual({(x["method"], x["group"]) for x in p["items"]},
+                         {("Расш_ОбработкаПроверкиЗаполнения", "REVIEW"), ("Расш_ОбработкаЗаполнения", "MUST_FIX")})
+        picked, _ = selection.select("names", data["findings"],
+                                     selection.Filter(flag=["FIELD_NOT_ADOPTED"], severity="error"))
+        self.assertEqual(sorted(e["key"].split("|")[3] for e in picked), ["Новое", "Расходы"])
+
+    def test_unassigned_reads(self):
+        from cfe_rebase import bsl
+        mod = bsl.Module("Процедура П(Парам)\n\tЕсли А = 1 Тогда Б = 2; КонецЕсли;\n\tВ = Б + Г.Сумма + Парам;\n"
+                         "\tДля Д = 1 По 3 Цикл Е = Д; КонецЦикла;\n\tЖ(1); Новый З;\nКонецПроцедуры\n")
+        self.assertEqual([(n, ln) for n, ln, _ in names.unassigned_reads(mod)], [("А", 2), ("Г", 3)])
 
 
 if __name__ == "__main__":

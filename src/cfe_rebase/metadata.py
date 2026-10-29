@@ -357,6 +357,10 @@ _CFG_HEAD_RE = {
     "purpose": re.compile(r"<ConfigurationExtensionPurpose>(\w+)</ConfigurationExtensionPurpose>"),
     "prefix": re.compile(r"<NamePrefix>([^<]*)</NamePrefix>"),
     "version": re.compile(r"<Properties>.*?<Version>([^<]*)</Version>", re.S),
+    # the configuration's own mode; <ConfigurationExtensionCompatibilityMode> and the <xr:Property> of InternalInfo do
+    # not match: neither has «<CompatibilityMode>» in it
+    "compat": re.compile(r"<CompatibilityMode>([^<]*)</CompatibilityMode>"),
+    "compat_state": re.compile(r"<xr:Property>CompatibilityMode</xr:Property>\s*<xr:State>(\w+)</xr:State>"),
 }
 
 
@@ -391,6 +395,8 @@ class Dump(object):
         self.purpose = None
         self.prefix = ""
         self.version = ""
+        self.compat = None  # <CompatibilityMode> of Configuration.xml; an extension often has none
+        self.compat_state = None  # an extension's control of that property (InternalInfo, «Notify» in a real extension)
         self.is_extension = False
         cfg = os.path.join(self.root, "Configuration.xml")
         if os.path.isfile(cfg):
@@ -410,6 +416,12 @@ class Dump(object):
             m = _CFG_HEAD_RE["version"].search(head)
             if m:
                 self.version = m.group(1)
+            m = _CFG_HEAD_RE["compat"].search(head)
+            if m:
+                self.compat = m.group(1).strip()
+            m = _CFG_HEAD_RE["compat_state"].search(head)
+            if m:
+                self.compat_state = m.group(1)
         self._modules = {}
         self._objects = {}
         self._errors = {}

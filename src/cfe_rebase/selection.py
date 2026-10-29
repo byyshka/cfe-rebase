@@ -53,8 +53,8 @@ ROWS = {"interceptors": "registry", "lint": "issues"}  # the list of findings in
 
 CALL_ERRORS = ("OWNER_REMOVED", "OWNER_RENAMED", "REMOVED", "TOO_FEW_ARGS", "TOO_MANY_ARGS", "MISSING",
                "NOT_EXPORT")  # in this order of rank
-BORROWED_ORDER = ("OBJECT_REMOVED", "OBJECT_RENAMED", "REMOVED", "RENAMED", "TYPE_CHANGED", "LIST_FIELD_LOST",
-                  "NAME_CLASH", "XML_UNREADABLE", "LIST_CHANGED", "NOT_IN_VENDOR")
+BORROWED_ORDER = ("COMPAT_MODE", "OBJECT_REMOVED", "OBJECT_RENAMED", "REMOVED", "RENAMED", "TYPE_CHANGED",
+                  "PROPERTY_CHANGED", "LIST_FIELD_LOST", "NAME_CLASH", "XML_UNREADABLE", "LIST_CHANGED", "NOT_IN_VENDOR")
 BORROWED_LEVEL = {"XML_UNREADABLE": "risk", "LIST_CHANGED": "risk", "NOT_IN_VENDOR": "info"}  # the rest: error
 # interceptors: the flags the adaptation plan calls MUST_FIX, CLARIFY and hides (plan.INT_MUST / INT_CLARIFY)
 INTERCEPTOR_ORDER = ("MISSING_BASE", "TARGET_RENAMED", "TARGET_UNCALLED", "SIGNATURE_MISMATCH", "SIGNATURE_CHANGED",
@@ -155,7 +155,7 @@ SPECS = {
                      lambda r: _l(r.get("flags"))),
     "names": (("ext", "module", "how", "name", "check"),
               lambda r: r.get("level") if r.get("level") in LEVELS else "info",
-              lambda r: 0 if r.get("check") in ("GONE_IN_NEW", "LIST_QUERY_FIELD_MISSING") else 1,
+              lambda r: 0 if r.get("check") in ("GONE_IN_NEW", "LIST_QUERY_FIELD_MISSING", "FIELD_NOT_ADOPTED") else 1,
               lambda r: [r.get("module"), r.get("form")] + _l(r.get("methods")),
               lambda r: [r.get("form"), r.get("module")],
               lambda r: [r.get("check"), r.get("how"), r.get("level")]),

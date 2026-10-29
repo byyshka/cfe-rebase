@@ -1099,20 +1099,30 @@ def check_borrowed(ext_root: list[str] | None = None, config_old: str | None = N
     без общего uuid — в detail); RENAMED — вендор переименовал реквизит, измерение, ресурс, значение перечисления или
     табличную часть с тем же uuid (new_name);
     TYPE_CHANGED — вендор сменил тип (длина строки, разрядность, состав типа сузился), в расширении старый; порядок
-    типов в составном типе не считается; NAME_CLASH — собственный реквизит или табличная часть расширения совпали по
-    имени с новым полем вендора; NOT_IN_VENDOR — поля нет ни в old, ни в new (доработанная конфигурация базы или поле
-    другого расширения — уточнить, не ошибка обновления); колонки заимствованных табличных частей — по тем же
-    правилам; LIST_FIELD_LOST — вендор изменил запрос динамического списка заимствованной формы, и новый запрос не
+    типов в составном типе не считается; PROPERTY_CHANGED — контролируемое свойство заимствованного объекта (его формы,
+    макета, команды; CompatibilityMode расширения — COMPAT_MODE) хранит значение old, а вендор сменил его в new:
+    платформа откажет «Значение контролируемого свойства … не совпадает со значением в расширяемой конфигурации» (part —
+    «свойство», name — имя свойства в XML, value / new_value; если new ссылается на объект, которого в расширении нет, в
+    detail — вызов cfe-borrow); свойства, которые расширение меняет само (синоним, представления, основные формы и
+    схема, состав подсистемы и движения документа, типы критерия отбора), и значения расширения, отличные от old, не
+    сверяются; NAME_CLASH — собственный реквизит или табличная часть расширения совпали по имени с новым полем вендора;
+    NOT_IN_VENDOR — поля нет ни в old, ни в new (доработанная конфигурация базы или поле другого расширения — уточнить,
+    не ошибка обновления); колонки заимствованных табличных частей — по тем же правилам; LIST_FIELD_LOST — вендор
+    изменил запрос динамического списка заимствованной формы, и новый запрос не
     выбирает поле, которое расширение выводит на форму (стандартные реквизиты Список.Ref / Date не сравниваются);
     LIST_CHANGED — этот список меняли и вендор, и расширение, и правка вендора в запрос расширения ещё не перенесена
     (в detail — что вендор добавил в запрос, а в запросе расширения нет, что убрал, а там осталось, и поля запроса
     расширения, которых новый запрос вендора не выбирает); список, где перенесена (или BaseForm — уже список new), не
     находка — summary.lists_ported, перечень — report; «изменил» — текст запроса, ManualQuery или MainTable: поля
     набора, которые платформа перечисляет по реквизитам объекта, не в счёт; XML_UNREADABLE — XML объекта расширения или вендора не разобран: других вердиктов по нему нет,
-    смотреть файл. Имена сравниваются без учёта регистра.
+    смотреть файл; COMPAT_MODE — <CompatibilityMode> в Configuration.xml расширения не тот, что у new (ext_value,
+    new_value; object — Конфигурация.<имя>, file — Configuration.xml): платформа откажет в загрузке; расширение без
+    этого свойства не проверяется, ConfigurationExtensionCompatibilityMode не сравнивается. Имена сравниваются без
+    учёта регистра.
     summary — счёты по проверкам, расширений и заимствованных объектов.
-    Выборка — общие параметры, описаны в конце: flag — check; уровни severity: error — OBJECT_REMOVED, OBJECT_RENAMED,
-    REMOVED, RENAMED, TYPE_CHANGED, LIST_FIELD_LOST, NAME_CLASH; risk — XML_UNREADABLE, LIST_CHANGED; info — NOT_IN_VENDOR; ключ —
+    Выборка — общие параметры, описаны в конце: flag — check; уровни severity: error — COMPAT_MODE, OBJECT_REMOVED,
+    OBJECT_RENAMED, REMOVED, RENAMED, TYPE_CHANGED, PROPERTY_CHANGED, LIST_FIELD_LOST, NAME_CLASH; risk —
+    XML_UNREADABLE, LIST_CHANGED; info — NOT_IN_VENDOR; ключ —
     ext|object|part|name|check."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
               "db": db, "to": to, "from_release": from_release, "registry": registry, "module": module,
@@ -1127,7 +1137,8 @@ def check_borrowed(ext_root: list[str] | None = None, config_old: str | None = N
 
         def shape(f, roots_):
             return _compact(dict({k: f.get(k) for k in ("ext", "object", "file", "part", "name", "new_name", "check",
-                                                         "detail", "forms")}, path=_join(roots_.get(f["ext"]), f["file"])))
+                                                         "ext_value", "new_value", "detail", "forms")},
+                                 path=_join(roots_.get(f["ext"]), f["file"])))
 
         dest = run.folder(out)
         data, roots = rerun(ext_root, dest)
@@ -1211,7 +1222,8 @@ def check_names(ext_root: list[str] | None = None, config_old: str | None = None
                 object: str | None = None, flag: list[str] | None = None, severity: str | None = None,
                 baseline: str | None = None, accepted: str | None = None) -> dict[str, Any]:
     """Имена формы вендора, которые читает код модулей заимствованных форм расширений (`names`), против Form.xml
-    вендора old и new: то, что не видят check_calls (не вызов) и check_borrowed (не реквизит объекта).
+    вендора old и new: то, что не видят check_calls (не вызов) и check_borrowed (не реквизит объекта); и поля объекта
+    вендора, которые модуль объекта заимствованного объекта читает без заимствования (FIELD_NOT_ADOPTED).
 
     ext_root — папки выгрузок расширений; config_old / config_new — выгрузки типовой; skip — расширения, которые
     пропустить. db / to / from_release / registry — пути из реестра баз (явные перекрывают).
@@ -1242,8 +1254,18 @@ def check_names(ext_root: list[str] | None = None, config_old: str | None = None
     расширение меняет и UseAlways (Form.xml против BaseForm), а поле UseAlways вендора new, которое запрос расширения
     выбирает, не загружают ни UseAlways расширения, ни его видимые элементы: если UseAlways расширения заменяет
     вендорский, поля нет в данных строки; заменяет платформа или сливает — статикой не доказано (в плане —
-    «уточнить»); new_in_new — поля не было в UseAlways old. summary — счёты по проверкам и уровням, форм и имён,
-    list_queries / list_queries_unjudged — подменённых запросов списков всего / не судится.
+    «уточнить»); new_in_new — поля не было в UseAlways old. FIELD_NOT_ADOPTED (how = module, form — модуль объекта,
+    например Документ.X.МодульОбъекта) — модуль объекта заимствованного объекта (справочник, документ, ПВХ, план счетов
+    / видов расчёта / обмена, бизнес-процесс, задача, обработка, отчёт) читает без квалификатора реквизит или
+    табличную часть, которые у объекта вендора в new есть, а в XML заимствования нет: конфигуратор компилирует модуль
+    расширения без них, проверка модулей (/CheckConfig) даёт «Переменная не определена (X)». Считается чтение, которому
+    в методе не предшествует присваивание этого имени (присваивание для конфигуратора объявляет локальную переменную,
+    его проверка модулей пропускает), не параметр и не Перем метода, не Перем модуля; ЭтотОбъект.X проверка модулей
+    тоже пропускает — только счётом (summary.object_module_this_unadopted). error — в old у вендора такого поля нет
+    (обращение пришло с переносом), risk — есть и в old («было и в old»: та же ошибка проверки была до обновления);
+    в плане prepare — «исправить» / «проверить». Модули менеджера и набора записей не читаются: реквизитов объекта в
+    их контексте нет. summary — счёты по проверкам и уровням, форм и имён, object_modules — модулей объектов
+    проверено, list_queries / list_queries_unjudged — подменённых запросов списков всего / не судится.
     Выборка — общие параметры, описаны в конце: flag — check, how или level; уровни severity — level находки; ключ
     — ext|module|how|name|check."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
@@ -1273,6 +1295,8 @@ def check_names(ext_root: list[str] | None = None, config_old: str | None = None
                    "forms_missing_new": data["stats"].get("forms_missing_new", 0),
                    "list_queries": data["stats"].get("list_queries", 0),
                    "list_queries_unjudged": data["stats"].get("list_queries_unjudged", 0),
+                   "object_modules": data["stats"].get("object_modules", 0),
+                   "object_module_this_unadopted": data["stats"].get("object_module_this_unadopted", 0),
                    "extensions": len(data["extensions"])}
         summary, report = _with_selection(summary, _report(dest, "names"), picked)
         return {"summary": summary, "items": picked["items"], "ranks": picked["ranks"], "report": report}
@@ -1480,7 +1504,13 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
     LF, line — первая строка с LF), OBJECT_RENAMED (info: объект в рабочей копии под другим именем с тем же uuid —
     его файлы сверены под новым путём), OBJECT_REMOVED (info: объект убран вместе с Configuration.xml — подтвердить) и
     CHILD_REMOVED (info: форма, макет или команда убраны вместе с записью в ChildObjects XML объекта — подтвердить;
-    file — Вид/Объект/Forms/Имя). Номера строк — по CR LF, LF и CR, как в файле.
+    file — Вид/Объект/Forms/Имя); без ext тоже — EXT_NAME_STALE (error: Rights.xml роли даёт права на
+    Configuration.<другое имя>, а Name в Configuration.xml расширения уже новое — переименование через cf-edit
+    modify-property Name роли не правит, платформа откажет «Неизвестный объект метаданных - Configuration.<старое
+    имя>» по разу на роль; old_name, new_name, line — первая ссылка) и EXT_NAME_STALE_DUMP_INFO (info: то же в
+    ConfigDumpInfo.xml, записи Configuration.<имя> и Configuration.<имя>.<модуль>; полная загрузка на нём не
+    отказала — проверено на реальных загрузках, править вместе с ролями). Номера строк — по CR LF, LF и CR, как в
+    файле.
     summary — расширений, файлов, модулей, errors, info, счёт по проверкам; without_source и without_source_names —
     расширения рабочей копии без пары в ext (для них только проверка структуры, файлы не сверялись).
     Выборка — общие параметры, описаны в конце: flag — check или severity; уровни severity: error | info, как у
@@ -1506,7 +1536,8 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
             raise BadInput("baseline: у check_work — только отчёт прошлого прогона (lint.json или папка с ним)")
 
         picked = _selected("lint", data, {}, issues, lambda x, _: _compact(
-            {k: x.get(k) for k in ("ext", "file", "path", "line", "check", "severity", "detail")}), inputs, dest, rerun)
+            {k: x.get(k) for k in ("ext", "file", "path", "line", "check", "severity", "detail", "old_name",
+                                   "new_name")}), inputs, dest, rerun)
         summary, report = _with_selection(summary, _report(dest, "lint"), picked)
         return {"summary": summary, "items": picked["items"], "ranks": picked["ranks"], "report": report}
 
@@ -1682,7 +1713,8 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
     compared), verdicts control_rebase, interceptors (rows, flagged, flags), calls (findings — с флагами, flags),
     queries (findings, unjudged), bodies (copies, vendor_changed, calltype — из них копий callType=Override),
     borrowed (findings, checks), registers (findings), names (findings, checks; в план идёт только
-    LIST_QUERY_FIELD_MISSING и LIST_FIELD_NOT_LOADED), plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько находок
+    LIST_QUERY_FIELD_MISSING, LIST_FIELD_NOT_LOADED и FIELD_NOT_ADOPTED),
+    plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько находок
     скрыто как шум). items — пункты MUST_FIX плана: ext, module, module_title, method, what (что произошло и что
     делать). План не покрывает собственные копии СКД и макетов вендора под другим именем и запись в регистры через
     ЗаполнитьЗначенияСвойств или структуру — их сверять по тексту. report — json (prepare.json), plan {json, md} и

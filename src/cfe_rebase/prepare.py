@@ -9,7 +9,7 @@ registry's dump command (an external program: cfe-rebase knows nothing about the
 make the work copy - a copy of the extension dump under git with the commit "before: <db> <from>" - unless it exists
 already (then it is left untouched); run control_rebase, interceptors, calls, queries, bodies, borrowed, registers and
 names into <reports>/prepare-<run_id[:8]>/<tool>/; merge their findings into an adaptation plan (plan.py: plan.json,
-plan.md; of names only LIST_QUERY_FIELD_MISSING and LIST_FIELD_NOT_LOADED);
+plan.md; of names only LIST_QUERY_FIELD_MISSING, LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED);
 print one screen and write the same data to prepare.json next to them.
 
 Exit code: 0 when every tool ran (conflicts are findings, not errors), 2 on bad input, 3 when the dump command, git or

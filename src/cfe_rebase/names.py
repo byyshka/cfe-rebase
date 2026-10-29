@@ -46,6 +46,17 @@ own Перем, its own attributes of the object). Checks:
                  UseAlways replaces the vendor's. Whether the platform replaces or merges UseAlways of an adopted form
                  is not documented and not provable from the dumps, so it is always a risk; new_in_new - the field
                  is not in the old vendor UseAlways.
+  FIELD_NOT_ADOPTED  (how = module) the object module of an object the extension adopts reads, without a qualifier, an
+                 attribute or a tabular section the vendor object has in new that the extension's XML of the object
+                 does not adopt. The Designer compiles the extension's module against the extension alone: the
+                 module check (/CheckConfig) fails with «Переменная не определена (X)» (a real case, РеализацияТоваровУслуг:
+                 ОснованиеНомер, ОснованиеДата - only Основание adopted). A read counts when it is not a parameter or a
+                 Перем of its method, not a Перем of the module, and no assignment of the name comes before it in the
+                 method: an assignment makes a local variable for the Designer and is not reported, nor is
+                 ЭтотОбъект.X (the module check passes both - real bases; ЭтотОбъект.X is counted in stats). error when
+                 the vendor object of old has no such field (the reference came with the port), risk when it has
+                 («было и в old»: the same check failed before the update). Manager and record set modules are not
+                 read: no object attributes are in their context.
 Names are compared case-insensitively. A form whose vendor Form.xml is missing in new is check_borrowed's (REMOVED)
 and is skipped here (counted in stats). Objects renamed by the vendor are looked up by uuid. The dumps are never
 written: --out inside --ext-root, --config-old or --config-new is refused.
@@ -62,7 +73,7 @@ from .control_rebase import inside
 
 HOWS = OrderedDict([("items", "элемент формы"), ("attribute", "реквизит формы / переменная модуля"),
                     ("object", "поле объекта"), ("parameter", "параметр формы"),
-                    ("list", "поле динамического списка")])
+                    ("list", "поле динамического списка"), ("module", "поле объекта в модуле объекта")])
 EXPLAIN = OrderedDict([
     ("GONE_IN_NEW", "имя было в форме вендора old, в new его нет, расширение его не добавляет"),
     ("NOT_IN_VENDOR", "имени нет ни в old, ни в new, ни в добавлениях расширения: создаётся кодом, чужое или опечатка"),
@@ -71,7 +82,13 @@ EXPLAIN = OrderedDict([
                                  "поля, которое нужно форме вендора new (элемент, UseAlways, код)"),
     ("LIST_FIELD_NOT_LOADED", "поле UseAlways вендора new в запросе расширения есть, но UseAlways расширения и его "
                               "видимые элементы его не загружают (замена или слияние UseAlways не доказаны)"),
+    ("FIELD_NOT_ADOPTED", "модуль объекта расширения читает без квалификатора реквизит или табличную часть вендора, "
+                          "которых нет в заимствовании: проверка модулей конфигуратора — «Переменная не определена»"),
 ])
+# kinds whose object module has the object's attributes and tabular sections in its context
+OBJECT_MODULE_KINDS = {"Справочник", "Документ", "ПланВидовХарактеристик", "ПланСчетов", "ПланВидовРасчета",
+                       "ПланОбмена", "БизнесПроцесс", "Задача", "Обработка", "Отчет"}
+LOOP_VAR = {"для", "for", "каждого", "each"}
 WORDS = {"элементы": "items", "items": "items", "объект": "object", "object": "object", "параметры": "parameter",
          "parameters": "parameter"}
 THIS = {"этотобъект", "этаформа", "thisobject", "thisform"}
@@ -781,6 +798,115 @@ def check_form(ext, form_rel, cfg_old, cfg_new, stats):
     return found + lists
 
 
+# ---- object modules: fields of the vendor object the extension does not adopt (FIELD_NOT_ADOPTED) ----------------
+
+def object_fields(o):
+    """{casefold: (name, what)} of the attributes, addressing attributes and tabular sections of an object."""
+    out = {}
+    if o is None:
+        return out
+    for bucket, what in (("attrs", "реквизит"), ("addr", "реквизит адресации"), ("ts", "табличная часть")):
+        for nm in getattr(o, bucket):
+            out.setdefault(nm.casefold(), (nm, what))
+    return out
+
+
+def unassigned_reads(mod):
+    """(name, line, method) of the unqualified identifiers live code reads (not a call, not a type after Новый) that
+    are not a parameter or a Перем of their method and are not assigned earlier in it: for the Designer an assignment
+    (at the start of a statement, or a loop variable) declares a local variable from there on. Module-level code
+    counts as one more method."""
+    toks = mod.toks
+    at_line, local = method_locals(mod)
+    seen = {}
+    for i, (k, v, line) in enumerate(toks):
+        if k != "id" or v.casefold() in bsl.KEYWORDS:
+            continue
+        prev = toks[i - 1] if i > 0 else None
+        if prev is not None and (prev[:2] == ("op", ".") or (prev[0] == "id" and prev[1].casefold() in bsl.KW_NEW)):
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if nxt is not None and nxt[:2] == ("op", "("):
+            continue
+        m = at_line.get(line)
+        if m is not None and line <= m.decl_end_line:
+            continue
+        key = v.casefold()
+        assigned = seen.setdefault(id(m), set())
+        start = (prev is None or prev[:2] == ("op", ";") or prev[0] in ("pre", "ann")
+                 or (prev[0] == "id" and prev[1].casefold() in STMT_START)
+                 or (m is not None and prev[2] <= m.decl_end_line))
+        if (start and nxt is not None and nxt[:2] == ("op", "=")) or (
+                prev is not None and prev[0] == "id" and prev[1].casefold() in LOOP_VAR):
+            assigned.add(key)
+            continue
+        if key in assigned or (m is not None and key in local[id(m)]):
+            continue
+        yield v, line, m
+
+
+def check_object_module(ext, rel, cfg_old, cfg_new, stats):
+    """FIELD_NOT_ADOPTED findings of the object module rel of an object the extension adopts."""
+    kind, name = metadata.module_owner(rel)
+    if kind not in OBJECT_MODULE_KINDS:
+        return []
+    own = ext.object(kind, name)
+    if own is None or not own.adopted:
+        return []
+    vendor = {}
+    for label, dump in (("old", cfg_old), ("new", cfg_new)):
+        vname = metadata.counterpart_name(ext, kind, name, dump)
+        vendor[label] = (vname, object_fields(dump.object(kind, vname) if vname else None))
+    new_name, new_fields = vendor["new"]
+    if new_name is None:
+        return []  # the vendor removed the object: borrowed (REMOVED)
+    adopted = object_fields(own)
+    missing = {k: v for k, v in new_fields.items() if k not in adopted}
+    mod = ext.module(rel)
+    if mod is None:
+        return []
+    stats["object_modules"] += 1
+    if not missing:
+        return []
+    toks = mod.toks
+    ignore = set(bsl.module_vars(toks, [(m.start_line, m.end_line) for m in mod.methods]))
+    ignore |= set(mod.by_name)
+    vendor_mod = cfg_new.module(metadata.object_module_rel(kind, new_name))
+    if vendor_mod is not None:
+        ignore |= set(vendor_mod.by_name)
+    ignore |= set(cfg_new.common_modules()) | set(ext.common_modules())
+    for how, nm, _, _ in references(toks):
+        if how == "attribute" and nm.casefold() in missing:
+            stats["object_module_this_unadopted"] += 1
+    occ = OrderedDict()
+    for nm, line, m in unassigned_reads(mod):
+        key = nm.casefold()
+        if key not in missing or key in ignore:
+            continue
+        e = occ.setdefault(key, {"lines": [], "methods": []})
+        if line not in e["lines"]:
+            e["lines"].append(line)
+        if m is not None and m.name not in e["methods"]:
+            e["methods"].append(m.name)
+    found = []
+    title = metadata.module_title(rel)
+    for key, e in occ.items():
+        field, what = missing[key]
+        in_old = key in vendor["old"][1]
+        detail = ("%s %s объекта %s.%s есть у вендора в new, в заимствовании расширения нет: в модуле объекта "
+                  "расширения имя без квалификатора не определено — проверка модулей конфигуратора даёт «Переменная не "
+                  "определена (%s)»; заимствовать или обращаться через ЭтотОбъект.%s" % (
+                      what, field, kind, new_name, field, field))
+        if in_old:
+            detail += "; было и в old: в old поле тоже есть и тоже не заимствовано — не от обновления"
+        else:
+            detail += "; в old у вендора этого поля нет — обращение пришло с переносом"
+        found.append(dict(ext=ext.name, form=title, module=rel, how="module", name=field, check="FIELD_NOT_ADOPTED",
+                          level="risk" if in_old else "error", line=e["lines"][0], lines=e["lines"],
+                          methods=e["methods"], detail=detail))
+    return found
+
+
 def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):
     exts = metadata.find_extensions(ext_roots, only, skip)
     findings, stats = [], Counter()
@@ -790,18 +916,24 @@ def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):
                 continue
             stats["form_files"] += 1
             findings.extend(check_form(ext, rel, cfg_old, cfg_new, stats))
+        for rel in ext.files("ObjectModule.bsl"):
+            if metadata.module_kind(rel) == "object":
+                findings.extend(check_object_module(ext, rel, cfg_old, cfg_new, stats))
     return exts, findings, stats
 
 
 def render(args, exts, findings, stats, elapsed):
     md = ["# Имена форм вендора, которые читает код расширений", ""]
     md.append("new: `%s`, old: `%s`. Расширений: %d, заимствованных форм с модулем: %d (формы нет в new: %d), "
-              "проверено имён: %d. Время: %.1f с." % (args.config_new, args.config_old, len(exts), stats["forms"],
-                                                     stats["forms_missing_new"], stats["names"], elapsed))
+              "проверено имён: %d, модулей объектов: %d. Время: %.1f с." % (
+                  args.config_new, args.config_old, len(exts), stats["forms"], stats["forms_missing_new"],
+                  stats["names"], stats["object_modules"], elapsed))
     md.append("")
     md.append("Код модуля заимствованной формы: `Элементы.X`, `Объект.X`, `Параметры.X`, `ЭтотОбъект.X` / "
               "`ЭтаФорма.X` и имена без квалификатора, которые в old были реквизитами формы или переменными модуля. "
-              "Комментарии, строки и блоки `#Удаление` не считаются.")
+              "Модуль объекта заимствованного объекта: имена без квалификатора, которые в new — реквизит или "
+              "табличная часть вендора, а в заимствовании их нет (`ЭтотОбъект.X` таких полей — только счётом: %d). "
+              "Комментарии, строки и блоки `#Удаление` не считаются." % stats["object_module_this_unadopted"])
     md.append("")
     counts = Counter(f["check"] for f in findings)
     md.append(fileio.md_table(["Проверка", "Находок", "Смысл"], [(k, counts.get(k, 0), v) for k, v in EXPLAIN.items()]))
@@ -820,7 +952,8 @@ def main(argv=None):
     fileio.console_utf8()
     ap = argparse.ArgumentParser(description="Имена форм вендора (элементы, реквизиты, параметры, поля объекта, "
                                              "переменные модуля), которые читает код заимствованных форм расширений, "
-                                             "против Form.xml вендора old и new")
+                                             "против Form.xml вендора old и new; поля объекта вендора, которые модуль "
+                                             "объекта расширения читает без заимствования")
     ap.add_argument("--ext-root", action="extend", nargs="+", required=True,
                     help="папка выгрузок расширений (или одна выгрузка); можно несколько")
     ap.add_argument("--ext", action="extend", nargs="+", help="только эти расширения (имя)")
@@ -845,8 +978,8 @@ def main(argv=None):
             "stats": dict(stats), "findings": findings}
     md_path, json_path = fileio.write_report(args.out, "names", render(args, exts, findings, stats, elapsed), data)
     counts = Counter(f["check"] for f in findings)
-    print("extensions: %d, adopted forms with a module: %d, names: %d, findings: %d, %.1fs" % (
-        len(exts), stats["forms"], stats["names"], len(findings), elapsed))
+    print("extensions: %d, adopted forms with a module: %d, names: %d, object modules: %d, findings: %d, %.1fs" % (
+        len(exts), stats["forms"], stats["names"], stats["object_modules"], len(findings), elapsed))
     if counts:
         print("checks: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))
     print(md_path)
