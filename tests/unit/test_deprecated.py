@@ -138,6 +138,10 @@ class Dumps(unittest.TestCase):
             for name, text in (("Платежи", pay), ("Деньги", money)):
                 write(os.path.join(base, "CommonModules", name + ".xml"), obj("CommonModule", name, []))
                 write(os.path.join(base, "CommonModules", name, "Ext", "Module.bsl"), text)
+            # another common module with a method of the same name: ЗначениеНастроек.СчетПоУмолчанию is its call, not
+            # a call of the catalog's method through a variable
+            write(os.path.join(base, "CommonModules", "ЗначениеНастроек.xml"),
+                  obj("CommonModule", "ЗначениеНастроек", []))
         ext = os.path.join(t, "ext", "Расш")
         write(os.path.join(ext, "Configuration.xml"), HEAD + '<Configuration uuid="c-ext"><Properties><Name>Расш</Name>'
               '</Properties></Configuration></MetaDataObject>')
@@ -207,7 +211,11 @@ class Dumps(unittest.TestCase):
         self.assertNotIn("TARGET_UNCALLED", row["flags"])
         self.assertEqual(row["deprecated"]["grade"], "info")
         self.assertTrue(any("вендор сам вызывает метод в new" in n for n in row["notes"]))
-        self.assertFalse(any(n.startswith("[риск]") for n in row["notes"]), row["notes"])
+        self.assertFalse(any(n.startswith("[риск] вендор пометил") for n in row["notes"]), row["notes"])
+        # Платежи.Заполнить stopped calling it, Продажи.Провести started: one path lost, a risk of its own
+        self.assertIn("CALLERS_LOST", row["flags"])
+        self.assertEqual([c["method"] for c in row["callers_lost"]], ["Заполнить"])
+        self.assertEqual([c["method"] for c in row["callers_new"]], ["Провести"])
         items = plan.build({}, {}, data, {"findings": []}, {"findings": []})["items"]
         sources = [src for x in items if x["method"] == "Расш_СчетПоУмолчанию" for src in x["sources"]]
         self.assertFalse([src for src in sources if "DEPRECATED" in src or "UNCALLED" in src], sources)

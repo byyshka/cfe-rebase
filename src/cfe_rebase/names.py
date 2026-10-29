@@ -27,6 +27,25 @@ own Перем, its own attributes of the object). Checks:
   NOT_IN_VENDOR  qualified name in neither old nor new nor the extension's additions: info - created from code, a
                  field of another extension or a typo; bare names are never reported this way
   XML_UNREADABLE a Form.xml (extension, old or new) does not parse: the form is not checked
+  LIST_QUERY_FIELD_MISSING  the extension replaces the query of a vendor dynamic list of the form - in code
+                 (<Список>.ТекстЗапроса / .QueryText = a literal, a concatenation of literals or a variable built from
+                 them in the same method; СтрЗаменить of such a text with literal arguments is applied) or in its
+                 Form.xml (its own ManualQuery text of the list differs from the one in BaseForm) - and the query does
+                 not select a field the vendor form of new needs from that list: the DataPath of an item
+                 (<Список>.<Поле>), a field of the list's UseAlways, or a read of the vendor form module new
+                 (Элементы.<Таблица>.ТекущиеДанные.<Поле>, the same through a variable, Элемент.ТекущиеДанные.<Поле>
+                 in a handler of the table). The platform silently drops such a column and the vendor code reading
+                 it fails («Поле объекта не обнаружено»). error when the old vendor form did not need the field (the
+                 release brought it), risk when it did (the same gap was there in old). Not compared: fields the
+                 vendor's own new query does not select either (made by code), the platform's DefaultPicture, a
+                 query that selects «*»; a text the extension builds from anything else (a call, the vendor's
+                 <Список>.ТекстЗапроса) is not judged (counted in stats: list_queries_unjudged).
+  LIST_FIELD_NOT_LOADED  such a replaced list whose UseAlways the extension changed (its Form.xml against BaseForm):
+                 a field of the new vendor UseAlways that the extension's query selects, but neither the extension's
+                 UseAlways nor a visible item of its form binds - the row data would not hold it if the extension's
+                 UseAlways replaces the vendor's. Whether the platform replaces or merges UseAlways of an adopted form
+                 is not documented and not provable from the dumps, so it is always a risk; new_in_new - the field
+                 is not in the old vendor UseAlways.
 Names are compared case-insensitively. A form whose vendor Form.xml is missing in new is check_borrowed's (REMOVED)
 and is skipped here (counted in stats). Objects renamed by the vendor are looked up by uuid. The dumps are never
 written: --out inside --ext-root, --config-old or --config-new is refused.
@@ -38,15 +57,20 @@ import sys
 import time
 from collections import Counter, OrderedDict
 
-from . import bsl, fileio, forms, metadata
+from . import bsl, fileio, forms, metadata, qparse
 from .control_rebase import inside
 
 HOWS = OrderedDict([("items", "элемент формы"), ("attribute", "реквизит формы / переменная модуля"),
-                    ("object", "поле объекта"), ("parameter", "параметр формы")])
+                    ("object", "поле объекта"), ("parameter", "параметр формы"),
+                    ("list", "поле динамического списка")])
 EXPLAIN = OrderedDict([
     ("GONE_IN_NEW", "имя было в форме вендора old, в new его нет, расширение его не добавляет"),
     ("NOT_IN_VENDOR", "имени нет ни в old, ни в new, ни в добавлениях расширения: создаётся кодом, чужое или опечатка"),
     ("XML_UNREADABLE", "Form.xml (расширения, old или new) не разбирается: форма не проверена"),
+    ("LIST_QUERY_FIELD_MISSING", "расширение подменяет запрос динамического списка вендора, а в его запросе нет "
+                                 "поля, которое нужно форме вендора new (элемент, UseAlways, код)"),
+    ("LIST_FIELD_NOT_LOADED", "поле UseAlways вендора new в запросе расширения есть, но UseAlways расширения и его "
+                              "видимые элементы его не загружают (замена или слияние UseAlways не доказаны)"),
 ])
 WORDS = {"элементы": "items", "items": "items", "объект": "object", "object": "object", "параметры": "parameter",
          "parameters": "parameter"}
@@ -177,14 +201,15 @@ def _object_fields(dump, main, own_only=False):
 
 def vendor_view(dump, form_rel):
     """(FormNames of the vendor form with module variables and object fields, {uuid: field name}, refs of the
-    vendor's form module {(how, casefold name)} | string values, error or None); None when Form.xml is missing."""
+    vendor's form module {(how, casefold name)} | string values, error or None, the parsed Form.xml, the form module
+    or None); None when Form.xml is missing."""
     path = dump.path(form_rel)
     if not os.path.isfile(path):
         return None
     try:
         root = forms.parse(path)
     except Exception as exc:  # noqa: BLE001 - expat errors of every kind: reported as XML_UNREADABLE
-        return None, None, None, "%s: %s" % (type(exc).__name__, exc)
+        return None, None, None, "%s: %s" % (type(exc).__name__, exc), None, None
     view = scope_names(root)
     mod = dump.module(metadata.form_module_rel(form_rel))
     view.names["attribute"].update({k: v for k, v in _module_vars(mod).items()
@@ -195,7 +220,7 @@ def vendor_view(dump, form_rel):
     if mod is not None:
         refs = {(how, name.casefold()) for how, name, _, _ in references(mod.toks)}
         refs |= {("str", t[1].casefold()) for t in mod.toks if t[0] == "str" and bsl.IDENT_RE.fullmatch(t[1])}
-    return view, uuids, refs, None
+    return view, uuids, refs, None, root, mod
 
 
 def references(toks, shadowed=None):
@@ -262,38 +287,432 @@ def bare_names(mod, at_line, local):
         yield v, line, m
 
 
+# ---- dynamic lists whose query the extension replaces (LIST_QUERY_FIELD_MISSING) ---------------------------------
+
+QUERY_PROPS = {"текстзапроса", "querytext"}
+CURRENT_DATA = {"текущиеданные", "currentdata"}
+# a form binds standard attributes of a dynamic list by their English names (Список.Ref) while a query names them in
+# Russian (Ссылка); DefaultPicture is the platform's own picture of a row, no query selects it
+LIST_EN = {"ref": "Ссылка", "date": "Дата", "number": "Номер", "deletionmark": "ПометкаУдаления",
+           "posted": "Проведен", "code": "Код", "description": "Наименование", "owner": "Владелец",
+           "parent": "Родитель", "isfolder": "ЭтоГруппа", "predefined": "Предопределенный",
+           "predefineddataname": "ИмяПредопределенныхДанных", "recorder": "Регистратор", "period": "Период",
+           "linenumber": "НомерСтроки", "active": "Активность", "type": "Тип", "dataversion": "ВерсияДанных"}
+LIST_PLATFORM = {"defaultpicture"}
+# a statement starts after these: «Если … Тогда Список.ТекстЗапроса = …»
+STMT_START = {"тогда", "then", "иначе", "else", "цикл", "do", "попытка", "try", "исключение", "except"}
+STMT_END = {"конецесли", "endif", "иначе", "else", "иначеесли", "elsif", "конеццикла", "enddo", "исключение",
+            "except", "конецпопытки", "endtry"}
+REPLACE_FUNCS = {"стрзаменить", "strreplace"}
+
+
+def _query_name(field):
+    """The name a query gives a list field a DataPath names (Ref -> Ссылка)."""
+    return LIST_EN.get(field.casefold(), field)
+
+
+def list_attrs(scope):
+    """{casefold name: Attribute node} of the dynamic lists among the attributes of a Form.xml scope."""
+    out = {}
+    attrs = scope.find("Attributes")
+    for a in (attrs.children if attrs is not None else []):
+        t = a.find("Type")
+        if a.tag == "Attribute" and a.get("name") and t is not None and \
+                any(ch.text.strip().endswith("DynamicList") for ch in t.children):
+            out[a.get("name").casefold()] = a
+    return out
+
+
+def list_query(attr):
+    """(ManualQuery, query text or None) of a dynamic list attribute."""
+    st = attr.find("Settings") if attr is not None else None
+    if st is None:
+        return False, None
+    manual = st.find("ManualQuery")
+    q = st.find("QueryText")
+    return (manual is not None and manual.text.strip() == "true"), (q.text if q is not None and q.text.strip()
+                                                                     else None)
+
+
+def _select_items(q):
+    """Items of the select list qparse.select_aliases reads: the first ВЫБРАТЬ of the last query of a batch."""
+    parts = [p for p in q.split(";") if qparse.SELECT_RE.search(p)]
+    kws = qparse.top_level_keywords(parts[-1]) if parts else []
+    for k, (start, word) in enumerate(kws):
+        if word in ("ВЫБРАТЬ", "SELECT"):
+            end = kws[k + 1][0] if k + 1 < len(kws) else len(parts[-1])
+            return qparse._split_top(parts[-1][start + len(word):end])
+    return []
+
+
+ALL_FIELDS_RE = re.compile(r"^(?:%s\s*\.\s*)?\*$" % qparse.ID)
+
+
+def selected(query):
+    """{casefold: expression} of the fields a list query selects, or None when it cannot be told (no ВЫБРАТЬ, «*» or
+    «Таблица.*» in the select list; «Документ.Товары.*» is a tabular section, a «.*» of a DCS clause elsewhere is not
+    the select list)."""
+    if not query:
+        return None
+    q = qparse.clean(query)
+    if not qparse.SELECT_RE.search(q) or any(ALL_FIELDS_RE.match(it.strip()) for it in _select_items(q)):
+        return None
+    return {k.casefold(): " ".join(v.split()) for k, v in qparse.select_aliases(q).items()}
+
+
+def _tables_of(root, list_name):
+    """{casefold table item name: [handler method names]} of the Table items bound to the list."""
+    out = {}
+    for node in root.iter():
+        if node.tag != "Table" or not node.get("name"):
+            continue
+        dp = node.find("DataPath")
+        if dp is None or dp.text.strip().casefold() != list_name.casefold():
+            continue
+        ev = node.find("Events")
+        out[node.get("name").casefold()] = [e.text.strip() for e in (ev.children if ev is not None else [])
+                                            if e.tag == "Event" and e.text.strip()]
+    return out
+
+
+def list_needs(root, mod, list_name):
+    """{casefolded query name of a field: (field as the form names it, [where])} of what a vendor form needs from its
+    dynamic list: DataPath of items (<Список>.<Поле>), UseAlways, and reads of its module:
+    Элементы.<Таблица>.ТекущиеДанные.<Поле> (directly or through a variable of the method) and
+    Элемент.ТекущиеДанные.<Поле> in a handler of the table's events."""
+    needs = OrderedDict()
+    low = list_name.casefold()
+
+    def need(field, where):
+        if field.casefold() in LIST_PLATFORM:
+            return
+        e = needs.setdefault(_query_name(field).casefold(), (_query_name(field), []))
+        if where not in e[1]:
+            e[1].append(where)
+
+    for node in root.iter():
+        if node.tag == "DataPath" and node.parent is not None and node.parent.get("name"):
+            path = node.text.strip().split(".")
+            if len(path) >= 2 and path[0].casefold() == low:
+                need(path[1], "элемент %s (Form.xml, стр. %d)" % (node.parent.get("name"), node.parent.line))
+    attr = list_attrs(root).get(low)
+    ua = attr.find("UseAlways") if attr is not None else None
+    for f in (ua.children if ua is not None else []):
+        path = f.text.strip().split(".")
+        if f.tag == "Field" and len(path) >= 2 and path[0].casefold() == low:
+            need(path[1], "UseAlways")
+    if mod is None:
+        return needs
+    tables = _tables_of(root, list_name)
+    handlers = {h.casefold() for hs in tables.values() for h in hs}
+    toks = mod.toks
+    for m in mod.methods:
+        a, b = mod.tok_range(m)
+        rows = set()  # casefolded variables of the method holding the current row of the list
+        item = m.params[0]["name"].casefold() if m.name.casefold() in handlers and m.params else None
+        for i in range(a, b):
+            k, v, line = toks[i]
+            if k != "id" or (i > 0 and toks[i - 1][:2] == ("op", ".")):
+                continue
+            low_v = v.casefold()
+            end = None
+            if low_v in ("элементы", "items") and i + 4 < b and toks[i + 1][:2] == ("op", ".") and \
+                    toks[i + 2][1].casefold() in tables and toks[i + 3][:2] == ("op", ".") and \
+                    toks[i + 4][1].casefold() in CURRENT_DATA:
+                end = i + 4
+            elif item and low_v == item and i + 2 < b and toks[i + 1][:2] == ("op", ".") and \
+                    toks[i + 2][1].casefold() in CURRENT_DATA:
+                end = i + 2
+            elif low_v in rows:
+                end = i
+            if end is None:
+                continue
+            if end + 2 < b and toks[end + 1][:2] == ("op", ".") and toks[end + 2][0] == "id" and \
+                    not (end + 3 < b and toks[end + 3][:2] == ("op", "(")):
+                need(toks[end + 2][1], "код вендора: %s, стр. %d" % (m.name, toks[end + 2][2]))
+            elif end != i and i >= 2 and toks[i - 1][:2] == ("op", "=") and toks[i - 2][0] == "id" and \
+                    end + 1 < b and toks[end + 1][:2] == ("op", ";"):
+                rows.add(toks[i - 2][1].casefold())
+    return needs
+
+
+def _rhs(toks, i, b):
+    """Tokens of the right-hand side starting at i up to «;» or the end of a statement block, and the index after."""
+    j, depth = i, 0
+    while j < b:
+        k, v, _ = toks[j]
+        if k == "op" and v in ("(", "["):
+            depth += 1
+        elif k == "op" and v in (")", "]"):
+            depth -= 1
+        elif depth <= 0 and ((k == "op" and v == ";") or (k == "id" and v.casefold() in STMT_END)):
+            break
+        j += 1
+    return toks[i:j], j
+
+
+def _args(toks):
+    """The arguments of a call given its tokens from «(» to the matching «)», split at top-level commas."""
+    out, cur, depth = [], [], 0
+    for t in toks:
+        if t[:2] in (("op", "("), ("op", "[")):
+            depth += 1
+            if depth == 1:
+                continue
+        elif t[:2] in (("op", ")"), ("op", "]")):
+            depth -= 1
+            if depth == 0:
+                out.append(cur)
+                break
+        elif t[:2] == ("op", ",") and depth == 1:
+            out.append(cur)
+            cur = []
+            continue
+        cur.append(t)
+    return out
+
+
+def resolve_text(rhs, env):
+    """The string an expression makes of literals, «+», variables of env (text or None) and СтрЗаменить; None when
+    any part is something else (a call, a property, the vendor's own ТекстЗапроса)."""
+    parts, i, n = [], 0, len(rhs)
+    while i < n:
+        k, v, _ = rhs[i]
+        nxt = rhs[i + 1][:2] if i + 1 < n else None
+        if k == "str":
+            parts.append(v)
+            i += 1
+        elif k == "id" and v.casefold() in REPLACE_FUNCS and nxt == ("op", "("):
+            depth, j = 0, i + 1
+            while j < n:
+                if rhs[j][:2] == ("op", "("):
+                    depth += 1
+                elif rhs[j][:2] == ("op", ")"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            args = _args(rhs[i + 1:j + 1])
+            if len(args) != 3:
+                return None
+            texts = [resolve_text(x, env) for x in args]
+            if texts[0] is None:
+                return None
+            parts.append(texts[0].replace(texts[1], texts[2]) if texts[1] and texts[2] is not None else texts[0])
+            i = j + 1
+        elif k == "id" and v.casefold() in env and nxt not in (("op", "."), ("op", "("), ("op", "[")):
+            if env[v.casefold()] is None:
+                return None
+            parts.append(env[v.casefold()])
+            i += 1
+        else:
+            return None
+        if i < n:
+            if rhs[i][:2] != ("op", "+"):
+                return None
+            i += 1
+    return "".join(parts) if parts else None
+
+
+def code_list_queries(mod, lists):
+    """[(list name as written, query text or None, line, method)] of the assignments «<Список>.ТекстЗапроса = …» (also
+    ЭтотОбъект.<Список>, .QueryText) to the lists `lists` (casefolded names) in the methods of the module; the text is
+    None when it is not made of literals of the same method."""
+    out = []
+    toks = mod.toks
+    for m in mod.methods:
+        a, b = mod.tok_range(m)
+        env = {}
+        i = a
+        while i < b:
+            k, v, line = toks[i]
+            start = i == a or toks[i - 1][:2] == ("op", ";") or toks[i - 1][0] == "pre" or \
+                (toks[i - 1][0] == "id" and toks[i - 1][1].casefold() in STMT_START)
+            if k != "id" or not start:
+                i += 1
+                continue
+            j = i + 2 if v.casefold() in THIS and i + 2 < b and toks[i + 1][:2] == ("op", ".") else i
+            if toks[j][0] == "id" and toks[j][1].casefold() in lists and j + 3 < b and \
+                    toks[j + 1][:2] == ("op", ".") and toks[j + 2][1].casefold() in QUERY_PROPS and \
+                    toks[j + 3][:2] == ("op", "="):
+                rhs, i = _rhs(toks, j + 4, b)
+                out.append((toks[j][1], resolve_text(rhs, env), toks[j][2], m))
+                continue
+            if i + 1 < b and toks[i + 1][:2] == ("op", "="):
+                rhs, i = _rhs(toks, i + 2, b)
+                env[v.casefold()] = resolve_text(rhs, env)
+                continue
+            i += 1
+    return out
+
+
+def use_always(attr, list_name):
+    """{casefolded query name: field} of the UseAlways fields of a list attribute; a «~» entry (a field the designer
+    could not resolve) loads nothing."""
+    out = {}
+    ua = attr.find("UseAlways") if attr is not None else None
+    for f in (ua.children if ua is not None else []):
+        path = f.text.strip().split(".")
+        if f.tag == "Field" and len(path) >= 2 and path[0].casefold() == list_name.casefold():
+            out[_query_name(path[1]).casefold()] = _query_name(path[1])
+    return out
+
+
+def _ua_raw(attr):
+    ua = attr.find("UseAlways") if attr is not None else None
+    return sorted(f.text.strip().casefold() for f in (ua.children if ua is not None else []) if f.tag == "Field")
+
+
+def visible_bound(scope, list_name):
+    """Casefolded query names of the list fields bound (DataPath <Список>.<Поле>) to items of the scope that are not
+    hidden (<Visible>false</Visible>); the BaseForm subtree is not the scope."""
+    out = set()
+    stack = list(scope.children)
+    while stack:
+        node = stack.pop()
+        if node.tag == "BaseForm":
+            continue
+        stack.extend(node.children)
+        if node.tag != "DataPath" or node.parent is None:
+            continue
+        path = node.text.strip().split(".")
+        hidden = node.parent.find("Visible")
+        if len(path) >= 2 and path[0].casefold() == list_name.casefold() and \
+                not (hidden is not None and hidden.text.strip() == "false"):
+            out.add(_query_name(path[1]).casefold())
+    return out
+
+
+def check_lists(base, form_rel, ext_root, base_form, module_rel, mod, old, new, stats):
+    """LIST_QUERY_FIELD_MISSING and LIST_FIELD_NOT_LOADED of one adopted form. old / new - (Form.xml root, form
+    module) of the vendor (old may be (None, None)); the queries the extension's code assigns to the vendor's lists
+    (mod) and its own Form.xml list queries that differ from BaseForm are compared with what the new vendor form
+    needs from each list; for such a list whose UseAlways the extension changed (its Form.xml against BaseForm), a
+    field of the new vendor UseAlways that the extension's query selects but its UseAlways and its visible items do
+    not load."""
+    new_root, new_mod = new
+    new_lists = list_attrs(new_root)
+    if not new_lists:
+        return []
+    replaced = []  # (list name, query text, file, line, method or None, source)
+    if mod is not None:
+        for name, text, line, m in code_list_queries(mod, set(new_lists)):
+            stats["list_queries"] += 1
+            if selected(text) is None:
+                stats["list_queries_unjudged"] += 1
+                continue
+            replaced.append((name, text, module_rel, line, m.name, "код"))
+    snapshot = list_attrs(base_form)
+    for key, attr in list_attrs(ext_root).items():
+        manual, text = list_query(attr)
+        if key not in new_lists or key not in snapshot or not manual or not text:
+            continue
+        if " ".join(text.split()) == " ".join((list_query(snapshot[key])[1] or "").split()):
+            continue  # the extension did not change the query: the vendor's new one applies
+        stats["list_queries"] += 1
+        if selected(text) is None:
+            stats["list_queries_unjudged"] += 1
+            continue
+        replaced.append((attr.get("name"), text, form_rel, attr.line, None, "Form.xml"))
+    found, cache, unloaded = [], {}, set()
+    mine_lists = list_attrs(ext_root)
+    for name, text, rel, line, method, source in replaced:
+        key = name.casefold()
+        if key not in cache:
+            old_root, old_mod = old
+            v_manual, v_text = list_query(new_lists[key])
+            cache[key] = (list_needs(new_root, new_mod, name),
+                          list_needs(old_root, old_mod, name) if old_root is not None else {},
+                          selected(v_text) if v_manual else None)
+        needs, old_needs, vendor_sel = cache[key]
+        mine = selected(text)
+        place = ("код, метод %s, стр. %d" % (method, line)) if method else ("Form.xml расширения, стр. %d" % line)
+        for fkey, (field, where) in needs.items():
+            stats["list_fields"] += 1
+            if fkey in mine:
+                continue
+            if vendor_sel is not None and fkey not in vendor_sel:
+                stats["list_fields_vendor_code"] += 1  # the vendor's own query does not select it: made by code
+                continue
+            fresh = fkey not in old_needs
+            expr = (vendor_sel or {}).get(fkey)
+            detail = "динамический список %s: расширение подменяет его запрос (%s), в запросе нет поля %s, которое " \
+                     "нужно форме вендора new: %s; %s — добавить в запрос расширения поле %s%s" % (
+                         name, place, field, "; ".join(where),
+                         "поле новое в new: форма old его не требовала" if fresh else
+                         "форма old его тоже требовала: колонки не было и до обновления",
+                         field, " (у вендора new: %s КАК %s, с источником выражения)" % (expr, field) if expr else "")
+            found.append(dict(base, module=rel, how="list", name="%s.%s" % (name, field), line=line, lines=[line],
+                              methods=[method] if method else [], check="LIST_QUERY_FIELD_MISSING",
+                              level="error" if fresh else "risk", detail=detail, list=name, field=field,
+                              needed_by=where, new_in_new=fresh, source=source))
+        attr, snap = mine_lists.get(key), snapshot.get(key)
+        if attr is None or _ua_raw(attr) == _ua_raw(snap):
+            continue  # the extension keeps the vendor's UseAlways: the new one applies
+        ext_ua, shown = use_always(attr, name), visible_bound(ext_root, name)
+        old_ua = use_always(list_attrs(old[0]).get(key) if old[0] is not None else None, name)
+        for fkey, field in use_always(new_lists[key], name).items():
+            if fkey in ext_ua or fkey in shown or fkey not in mine or (key, fkey) in unloaded:
+                continue
+            unloaded.add((key, fkey))
+            fresh = fkey not in old_ua
+            detail = "динамический список %s: расширение подменяет его запрос (%s) и меняет его UseAlways (Form.xml " \
+                     "расширения, стр. %d); поле %s есть в UseAlways вендора new и в запросе расширения, но не в " \
+                     "UseAlways расширения и не в его видимых элементах — если UseAlways расширения заменяет " \
+                     "вендорский, поле не загружается в данные строки и код вендора, читающий его, его не получит; " \
+                     "%s; заменяет платформа UseAlways или сливает — статикой не доказано, проверить в базе — " \
+                     "добавить %s.%s в UseAlways списка в расширении" % (
+                         name, place, attr.line, field,
+                         "поле новое в UseAlways new" if fresh else "в UseAlways old оно тоже было", name, field)
+            found.append(dict(base, module=form_rel, how="list", name="%s.%s" % (name, field), line=attr.line,
+                              lines=[attr.line], methods=[], check="LIST_FIELD_NOT_LOADED", level="risk",
+                              detail=detail, list=name, field=field, needed_by=["UseAlways"], new_in_new=fresh,
+                              source="Form.xml"))
+    return found
+
+
 def check_form(ext, form_rel, cfg_old, cfg_new, stats):
     """Findings of the module of one adopted form of the extension."""
     module_rel = metadata.form_module_rel(form_rel)
-    if not ext.exists(module_rel):
-        return []
+    has_module = ext.exists(module_rel)
     title = metadata.form_title(form_rel)
     base = {"ext": ext.name, "form": title, "module": module_rel}
     try:
         root = forms.parse(ext.path(form_rel))
     except Exception as exc:  # noqa: BLE001
+        if not has_module:
+            return []
         return [dict(base, how="", name="", check="XML_UNREADABLE", level="risk", line=None, lines=[], methods=[],
                      detail="Form.xml расширения не разбирается: %s — %s" % (form_rel, exc))]
     base_form = root.find("BaseForm")
     if base_form is None:
         return []
-    stats["forms"] += 1
+    if has_module:
+        stats["forms"] += 1
     views = {}
     for label, dump in (("old", cfg_old), ("new", cfg_new)):
         rel = metadata.counterpart_rel(ext, form_rel, dump)[0]
         views[label] = vendor_view(dump, rel)
     if views["new"] is None:
-        stats["forms_missing_new"] += 1
+        if has_module:
+            stats["forms_missing_new"] += 1
         return []
     broken = [(label, v[3]) for label, v in views.items() if v is not None and v[3]]
     if broken:
+        if not has_module:
+            return []
         return [dict(base, how="", name="", check="XML_UNREADABLE", level="risk", line=None, lines=[], methods=[],
                      detail="Form.xml в %s не разбирается: %s; форма не проверена" % (
                          ", ".join(lb for lb, _ in broken), "; ".join(e for _, e in broken)))]
-    old, old_uuids, _, _ = views["old"] if views["old"] is not None else (FormNames(), {}, set(), None)
-    new, new_uuids, new_refs, _ = views["new"]
+    old, old_uuids, _, _, old_root, old_mod = views["old"] if views["old"] is not None else \
+        (FormNames(), {}, set(), None, None, None)
+    new, new_uuids, new_refs, _, new_root, new_mod = views["new"]
+    mod = ext.module(module_rel) if has_module else None
+    lists = check_lists(base, form_rel, root, base_form, module_rel, mod, (old_root, old_mod), (new_root, new_mod),
+                        stats)
+    if mod is None:
+        return lists
     own = scope_names(root, scope_names(base_form))
-    mod = ext.module(module_rel)
     own.names["attribute"].update(_module_vars(mod))
     # the extension's own fields of the object: its form need not adopt the attribute Объект, so the object is also
     # taken from the vendor's main attribute, by the extension's name of it
@@ -359,7 +778,7 @@ def check_form(ext, form_rel, cfg_old, cfg_new, stats):
             found.append(dict(row, check="NOT_IN_VENDOR", level="info",
                               detail="%s %s: нет ни в old, ни в new, ни в добавлениях расширения — создаётся кодом, "
                                      "чужое или опечатка" % (HOWS[how], e["name"])))
-    return found
+    return found + lists
 
 
 def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None):

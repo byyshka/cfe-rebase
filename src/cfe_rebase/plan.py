@@ -8,14 +8,20 @@ One item per extension + module + method (or call site / query place), grouped:
              not in new, adopted metadata the vendor removed or retyped, a dynamic list of an adopted form whose new
              query drops a field of the extension, a register write that misses a new dimension, uses a dimension
              the vendor made a resource or an attribute, or goes to a register the vendor removed, an interceptor or
-             a call of a method the vendor made obsolete in this release (TARGET_DEPRECATED / TARGET_UNCALLED,
-             CALLS_DEPRECATED), a call into a module of an adopted object the vendor removed or renamed, the
-             extension's own method there included (OWNER_REMOVED / OWNER_RENAMED);
-  REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either),
+             a call of a method the vendor made obsolete in this release (TARGET_DEPRECATED, CALLS_DEPRECATED), an
+             interceptor of a method the vendor code stopped calling on all paths (TARGET_UNCALLED) or on some of a
+             few, through a vendor method that is still there (CALLERS_LOST, at most FEW_CALLERS callers in old), a
+             call into a module of an adopted object the vendor removed or renamed, the extension's own method there
+             included (OWNER_REMOVED / OWNER_RENAMED), a dynamic list whose query the extension replaces without a
+             field the new vendor form needs (names: LIST_QUERY_FIELD_MISSING);
+  REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either, a
+             list field the old vendor form needed as well),
              and MUST_FIX items in code nothing live calls (no references, or references only from such code);
-  CLARIFY  - questions of design: the same target in several extensions, a base method new in this release, an
-             interception of a method that was not in old, an adopted object or field in neither release, an object or
-             register XML that does not parse (look at the file);
+  CLARIFY  - questions of design: the same target in several extensions, CALLERS_LOST of a method with many vendor
+             callers or lost only with the vendor methods that called it, a base method new in this release, an
+             interception of a method that was not in old, an adopted object or field in neither release, an object
+             or register XML that does not parse (look at the file), a list field the extension's UseAlways may not
+             load (names: LIST_FIELD_NOT_LOADED - whether the platform replaces or merges UseAlways is not proven);
   the rest is counted by kind only (DEAD_BINDING, DIRECTIVE_MISMATCH, a vendor change under &Перед / &После, a
   compatible signature change, query fields that do not depend on the release).
 The rules come from three hand-made ports (UT 11.5.22 -> 11.5.27): the human changed 41 of the 45 MUST_FIX items; of
@@ -43,8 +49,24 @@ INT_MUST = {"SIGNATURE_CHANGED": "сигнатура базового метод
             "MISSING_BASE": "перехватываемого метода в new нет",
             "TARGET_RENAMED": "вендор переименовал объект модуля (uuid тот же) — переименовать заимствование "
                               "(borrow-edit --rename), ссылки на старое имя в коде поправить",
-            "TARGET_UNCALLED": "вендор пометил метод устаревшим и в new его не вызывает: перехват не выполнится — "
-                               "перенести на метод, который вендор вызывает вместо него"}
+            "TARGET_UNCALLED": "код вендора в old базовый метод вызывал, в new — нигде: перехват не выполнится — "
+                               "перенести на метод, который вендор вызывает вместо него",
+            "CALLERS_LOST": "код вендора в new перестал вызывать базовый метод на части путей (callers_lost): там "
+                            "доработка больше не выполняется — найти, что вендор вызывает вместо него, и перенести "
+                            "или продублировать перехват"}
+# CALLERS_LOST is a fix when a business method (at most FEW_CALLERS vendor callers in old) lost a caller that is still
+# there in new and calls something else now - a real break: ПриЗаписи of ТоварыКОтгрузке (3 callers) calls
+# ДанныеДляФормированияОчереди… + АктуализироватьОчередь… instead of ДобавитьВОчередьФормированияРасходныхОрдеров.
+# It is a question otherwise: a library method (ДлительныеОперации.ВыполнитьВФоне - 498 callers in UT 11.5.22) loses
+# callers in every release, and a caller the vendor deleted with its whole path (СервисEDIУТ.ПриОтменеЗаказаКлиента,
+# СоглашениеПриИзмененииЗавершение of the ЗаказКлиента form, which a hand port left alone) says the logic
+# moved, not where - whether the customization is needed there is up to its author
+FEW_CALLERS = 10
+CALLERS_LOST_MANY = ("код вендора в new перестал вызывать базовый метод на части путей (callers_lost), а вызывающих "
+                     "его мест много (%d в old) — проверить, нужна ли доработка на потерянных путях")
+CALLERS_LOST_GONE = ("код вендора в new перестал вызывать базовый метод: вызывавшие его методы вендор удалил "
+                     "(callers_lost, method_in_new: false) — проверить, куда перенесена их логика и нужна ли там "
+                     "доработка")
 INT_CLARIFY = {"NEW_BASE": "базовый метод появился только в new",
                "CONFLICT": "одна цель перехвачена в нескольких расширениях",
                "OVERRIDDEN?": "перехват, возможно, перекрыт другим расширением (порядок подключения не задан)",
@@ -120,7 +142,14 @@ def _interceptors(p, icp):
         args = (r["ext"], r["module"], r["ext_method"])
         shown = False
         for f in r.get("flags") or []:
-            if f in INT_MUST:
+            if f == "CALLERS_LOST" and (r.get("vendor_callers") or {}).get("old", 0) > FEW_CALLERS:
+                p.add("CLARIFY", *args, CALLERS_LOST_MANY % r["vendor_callers"]["old"], "interceptors:" + f,
+                      r.get("module_title"))
+                shown = True
+            elif f == "CALLERS_LOST" and all(c.get("method_in_new") is False for c in r.get("callers_lost") or []):
+                p.add("CLARIFY", *args, CALLERS_LOST_GONE, "interceptors:" + f, r.get("module_title"))
+                shown = True
+            elif f in INT_MUST:
                 p.add("MUST_FIX", *args, INT_MUST[f], "interceptors:" + f, r.get("module_title"))
                 shown = True
             elif f in INT_CLARIFY:
@@ -222,12 +251,27 @@ def _registers(p, registers):
               "запись в регистр " + f["detail"], "registers:" + kind, f.get("module_title"))
 
 
-def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None):
+def _names(p, names):
+    """Only LIST_QUERY_FIELD_MISSING and LIST_FIELD_NOT_LOADED of the names report: the other names checks are not in
+    the plan."""
+    for f in (names or {}).get("findings", []):
+        if f.get("check") not in ("LIST_QUERY_FIELD_MISSING", "LIST_FIELD_NOT_LOADED"):
+            continue
+        method = (f.get("methods") or [None])[0]
+        if f["check"] == "LIST_FIELD_NOT_LOADED":
+            group = "CLARIFY"
+        else:
+            group = "MUST_FIX" if f.get("level") == "error" else "REVIEW"
+        p.add(group, f["ext"], f["module"], method, f["detail"], "names:" + f["check"], f.get("form"))
+
+
+def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None, names=None):
     """{'items': [...], 'counts': {group: n}, 'hidden': {kind: n}, 'not_covered': text}; items are ordered by group,
     then extension and module. A MUST_FIX item in code no extension calls (UNBOUND, or a caller without references)
     goes to REVIEW with a note; so does one whose method is referenced only from such code (refs.liveness: the
     caller_live of calls, the method_live of queries and registers). borrowed - the report of borrowed.py (adopted metadata against new), registers - of
-    registers.py (writes to registers whose structure changed); both optional."""
+    registers.py (writes to registers whose structure changed), names - of names.py (only LIST_QUERY_FIELD_MISSING and
+    LIST_FIELD_NOT_LOADED are taken); all three optional."""
     p = Plan()
     _control(p, ctl)
     _bodies(p, bodies)
@@ -236,6 +280,7 @@ def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None):
     _queries(p, queries)
     _borrowed(p, borrowed)
     _registers(p, registers)
+    _names(p, names)
     dead = {(d["ext"], d["module"], d["method"]) for d in (icp.get("dead_code") or {}).get("UNBOUND", [])}
     dead |= {(f["ext"], f["module"], f.get("caller") or "") for f in calls.get("findings", [])
              if f.get("caller_live") in refs.DEAD}

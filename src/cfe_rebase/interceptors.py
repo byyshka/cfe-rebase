@@ -22,8 +22,17 @@ Flags (registry):
   DEAD_BINDING        Form.xml binds a handler that the extension form module does not have
   TARGET_DEPRECATED   the vendor marks the base method obsolete in new (region УстаревшиеПроцедурыИФункции or a header
                       comment «Устарела»); [риск] when it became obsolete only in new, [инфо] when old marked it too
-  TARGET_UNCALLED     an obsolete base method the vendor code called in old and no longer calls in new: the interceptor
-                      stays bound, but nothing runs it (counted by text over the vendor modules, obsolete targets only)
+  TARGET_UNCALLED     a base method the vendor code called in old and calls nowhere in new (and the platform does not
+                      run it as an event handler, and new names it neither through a variable nor in a string -
+                      vendor_mentions, then it is CALLERS_LOST): the interceptor stays bound, but nothing runs it
+  CALLERS_LOST        some vendor callers of the base method in old are gone in new while it is still called elsewhere
+                      (a real case: СкладыСервер.ДобавитьВОчередьФормированияРасходныхОрдеров lost its call from posting): the
+                      customization no longer runs on that path; callers_lost [{file, method, title, line_old,
+                      instead - what that method calls in new and did not in old, method_in_new}], callers_new;
+                      a caller that reaches the target in new through vendor methods within REACH_DEPTH calls is
+                      not lost: callers_moved_deeper [{file, method, title, line_old, via}].
+                      Both are counted by text over the vendor modules (vendor_callers) for every interception whose
+                      base method is in old and new: vendor_calls {old, new}.
 Dead code (separate section):
   UNBOUND             handler-like method (…Перед/…После/…Вместо, event names) with no annotation, no Form.xml or
                       XML binding and no call or string reference anywhere in the extensions
@@ -36,6 +45,7 @@ import re
 import sys
 import time
 from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 from . import bsl, fileio, forms, metadata, refs
 
@@ -56,11 +66,14 @@ EXPLAIN = OrderedDict([
     ("DEAD_BINDING", "в Form.xml назначен обработчик, которого нет в модуле формы расширения"),
     ("TARGET_DEPRECATED", "вендор пометил базовый метод устаревшим в new (область УстаревшиеПроцедурыИФункции или "
                           "комментарий «Устарела»)"),
-    ("TARGET_UNCALLED", "устаревший базовый метод: в old код вендора его вызывал, в new — нет; перехват молча мёртв"),
+    ("TARGET_UNCALLED", "базовый метод: в old код вендора его вызывал, в new — нигде; перехват молча мёртв"),
+    ("CALLERS_LOST", "часть вызовов базового метода из кода вендора old в new пропала: на этих путях доработка больше "
+                     "не выполняется"),
 ])
 SEVERITY = {"CONFLICT": 1, "OVERRIDDEN": 1, "DEAD_BINDING": 2, "MISSING_BASE": 2, "NEW_BASE": 2, "SIGNATURE_MISMATCH": 1,
             "CONTROL_MISMATCH": 1, "DIRECTIVE_MISMATCH": 2, "OVERRIDDEN?": 2, "SIGNATURE_CHANGED": 3,
-            "BINDING_CHANGED": 3, "TARGET_RENAMED": 2, "TARGET_UNCALLED": 1, "TARGET_DEPRECATED": 2}
+            "BINDING_CHANGED": 3, "TARGET_RENAMED": 2, "TARGET_UNCALLED": 1, "TARGET_DEPRECATED": 2,
+            "CALLERS_LOST": 2}
 
 HANDLER_SUFFIX_RE = re.compile(r"(Перед|После|Вместо)$", re.IGNORECASE)
 ITEM_EVENTS = [x for x in """
@@ -316,6 +329,9 @@ def check_row(ctx, r):
             notes.append("[%s] вендор пометил метод устаревшим в new (%s)%s" % (
                 "инфо" if dep_old else "риск", dep_new, "; в old тоже" if dep_old else
                 ": найти, что вендор вызывает вместо него, и перенести перехват туда"))
+    # for mark_callers: the base module in each release and whether the base method is there
+    r["_rel_new"], r["_rel_old"] = rel_new, rel_old
+    r["_t_new"], r["_t_old"] = t_new is not None, t_old is not None
     r["flags"] = flags
     r["notes"] = notes
 
@@ -396,77 +412,499 @@ def check_groups(ctx, rows):
     return out
 
 
-def vendor_calls(dump, targets):
-    """Calls of configuration methods in the live code of all modules of a configuration dump, counted by text:
-    {(module rel key, method casefold): n}. targets - [(module rel, method)]. A call counts when it names the method
-    with the qualifier of its module (the common module, the object of a manager module) or, unqualified, inside the
-    module itself or anywhere for a global common module; the declaration does not count. Strings are blanked
-    (ОбщийМодуль("X") is not seen), a call split over lines is not seen: an estimate for TARGET_UNCALLED, not a proof."""
+CALL_RE = re.compile(r"(?<![\wЁё])([\wЁё]+)\s*\(")
+DYN_MODULE_HEAD_RE = re.compile(r'(?:ОбщийМодуль|CommonModule)\s*\(\s*""\s*\)\s*$', re.IGNORECASE)
+XML_CALLER_DIRS = (("eventsubscriptions", "ПодпискаНаСобытие"), ("scheduledjobs", "РегламентноеЗадание"))
+SKIP_DIRS = {"templates", "help", "pictures"}
+SHOWN_CALLERS = 3
+REACH_DEPTH = 3  # calls from a lost caller to the target through the vendor's own methods
+REACH_BUDGET = 200  # methods visited per lost caller
+MANAGERS = {x.casefold() for x in """Справочники Документы РегистрыСведений РегистрыНакопления РегистрыБухгалтерии
+РегистрыРасчета Обработки Отчеты ПланыВидовХарактеристик ПланыСчетов ПланыВидовРасчета ПланыОбмена БизнесПроцессы Задачи
+Перечисления Константы ЖурналыДокументов Catalogs Documents InformationRegisters AccumulationRegisters DataProcessors
+Reports""".split()}
+DECL_START_RE = re.compile(r"^[ \t﻿\xa0]*(?:(?:Асинх|Async)\s+)?(?:Процедура|Функция|Procedure|Function)\s+([\wЁё]+)",
+                           re.IGNORECASE)
+END_RE = re.compile(r"^[ \t\xa0]*(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)(?![\wЁё])", re.IGNORECASE)
+
+
+def vendor_callers(dump, targets):
+    """Where the vendor code of a configuration dump calls configuration methods, found by text in one pass over the
+    dump: {(module rel key, method casefold): {"calls": n, "callers": {(file rel key, method casefold or ""): caller}}},
+    caller = {file, method (None for the module body or an XML handler), title, line (first call), calls}.
+    targets - [(module rel, method)]. A call counts when it names the method with the qualifier of its module (the
+    common module - by name or ОбщийМодуль("X"), the object of a manager module) or, unqualified or through
+    ЭтотОбъект / ЭтаФорма, inside the module itself, or unqualified anywhere for a global common module; the
+    declaration does not count. A handler of an event subscription or a scheduled job (<Handler>CommonModule.X.M) is a
+    caller too. Not seen: a call through a variable (Объект.Метод() of an object module), a call split over lines, a
+    name in a string (ОписаниеОповещения, Выполнить) - an estimate for CALLERS_LOST / TARGET_UNCALLED, not a proof.
+    Lines are found by the names as declared (str.find in the files a byte probe passes: the module of a target, a
+    file naming a qualified target's module and method, a file naming a method of a global module) and only those
+    lines are lexed: a line that does not start with «|» starts outside a string literal, so it lexes on its own, and
+    the full lexer over the ~1000 modules a probe passes cost a minute per run."""
     want = defaultdict(list)  # method casefold -> [(key, rel key, qualifier casefold or None, anywhere)]
     globals_ = {g.casefold() for g in dump.global_common_modules()}
-    counts = {}
-    probes = set()
+    res = {}
+    own = defaultdict(set)  # rel key of a target module -> {method names as declared}
+    by_module = defaultdict(set)  # module (common or object) name as declared, bytes -> {method name}
+    bare = set()  # method names of targets in global common modules
+    xml_want = {}  # "x.method" casefold of common module targets -> key
     for rel, name in targets:
         key = (metadata.rel_key(rel), name.casefold())
-        if key in counts:
+        if key in res:
             continue
-        counts[key] = 0
+        res[key] = {"calls": 0, "callers": OrderedDict()}
         mk = metadata.module_kind(rel)
         _, owner = metadata.module_owner(rel)
         qual = owner.casefold() if owner and mk in ("common", "manager", "valuemanager") else None
-        probes.add(name.encode("utf-8"))
-        want[name.casefold()].append((key, metadata.rel_key(rel), qual, mk == "common" and qual in globals_))
+        anywhere = mk == "common" and qual in globals_
+        own[key[0]].add(name)
+        if anywhere:
+            bare.add(name)
+        elif qual:
+            by_module[owner.encode("utf-8")].add(name)
+        want[name.casefold()].append((key, key[0], qual, anywhere))
+        if mk == "common" and owner:
+            xml_want["%s.%s" % (qual, name.casefold())] = key
     if not want:
-        return counts
-    pattern = re.compile(r"(?<![\wЁё])(%s)\s*\(" % "|".join(re.escape(n) for n in want), re.IGNORECASE)
-    for dp, _, files in os.walk(dump.root):
-        for fn in files:
-            if not fn.lower().endswith(".bsl"):
+        return res
+    bare_b = [(n, n.encode("utf-8")) for n in bare]
+    by_module_b = [(q, [(n, n.encode("utf-8")) for n in names]) for q, names in by_module.items()]
+
+    def add(key, rel, method, title, line):
+        callers = res[key]["callers"]
+        ck = (metadata.rel_key(rel), method.casefold() if method else "")
+        if ck not in callers:
+            callers[ck] = {"file": rel, "method": method, "title": title, "line": line, "calls": 0}
+        callers[ck]["calls"] += 1
+        res[key]["calls"] += 1
+
+    if xml_want:
+        for folder, title in XML_CALLER_DIRS:
+            for path in _files(dump.root, folder, ".xml"):
+                _xml_callers(dump, path, title, xml_want, add)
+    for rel, path in sorted(_bsl_files(dump.root)):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        rk = rel.casefold()
+        names = set(own.get(rk, ()))
+        names.update(n for n, nb in bare_b if nb in data)
+        for q, lst in by_module_b:
+            if q in data:
+                names.update(n for n, nb in lst if nb in data)
+        if not names:
+            continue
+        text = fileio.read_text(path)
+        lines = text.split("\n")
+        for no in _lines_naming(text, names):
+            raw = lines[no - 1]
+            if raw.lstrip(" \t﻿\xa0").startswith(("//", "|", "#")):
                 continue
-            path = os.path.join(dp, fn)
-            with open(path, "rb") as fh:
-                data = fh.read()
-            if not any(b in data for b in probes):  # the vendor writes a name as declared; a byte probe is enough
+            t = bsl.lex_lines([raw])[0]
+            if t.kind != "code" or bsl.DECL_RE.match(t.blank):
                 continue
-            rel = metadata.rel_key(os.path.relpath(path, dump.root))
-            lines = fileio.read_text(path).split("\n")
-            for t in bsl.lex_lines(lines):
-                if t.kind != "code" or bsl.DECL_RE.match(t.blank):
+            for m in CALL_RE.finditer(t.blank):
+                cands = want.get(m.group(1).casefold())
+                if not cands:
                     continue
-                for m in pattern.finditer(t.blank):
-                    head = t.blank[:m.start()].rstrip()
-                    q = None
-                    if head.endswith("."):
-                        qm = re.search(bsl.IDENT + r"\s*$", head[:-1])
-                        q = qm.group(0).strip().casefold() if qm else "?"
-                    for key, trel, qual, anywhere in want[m.group(1).casefold()]:
-                        if (q is not None and q == qual) or (q is None and (rel == trel or anywhere)):
-                            counts[key] += 1
-    return counts
+                head = t.blank[:m.start()].rstrip()
+                q = None
+                if head.endswith("."):
+                    qm = re.search(bsl.IDENT + r"\s*$", head[:-1])
+                    q = qm.group(0).strip().casefold() if qm else "?"
+                    if q == "?" and DYN_MODULE_HEAD_RE.search(head[:-1]):
+                        q = _dyn_module(t.code, m.group(1))
+                for key, trel, qual, anywhere in cands:
+                    if (q is not None and q == qual) or (rk == trel and (q is None or q in refs.SELF_QUALIFIERS)) \
+                            or (q is None and anywhere):
+                        name = _enclosing(lines, no)
+                        add(key, rel, name, "%s.%s" % (metadata.module_title(rel), name or "<тело модуля>"), no)
+    return res
 
 
-def mark_uncalled(ctx, rows):
-    """TARGET_UNCALLED on obsolete targets the old vendor code called and the new one does not."""
+def vendor_mentions(dump, targets, limit=SHOWN_CALLERS):
+    """Places in the vendor code that may run a method although vendor_callers sees no call: a call through a
+    variable or an expression (МенеджерОбъекта.ПолучитьДанныеДляПечатнойФормыТОРГ12(...) of ОбменСКонтрагентамиУТ -
+    the print manager of any document) and the full name in a string literal (ИмяМетода = "СостоянияДокументов.
+    ОтразитьСостоянияДокументовВРегистрахСостояний" of a deferred job in 11.5.27). {(module rel key, method casefold):
+    [{title, line, how}]}, at most `limit` places each. A separate pass, only for targets vendor_callers found no
+    call of in new (TARGET_UNCALLED candidates): their method names are the byte probes."""
+    res, probes, want = {}, [], defaultdict(list)
+    commons = set(dump.common_modules())
+    for rel, name in targets:
+        key = (metadata.rel_key(rel), name.casefold())
+        if key in res:
+            continue
+        res[key] = []
+        _, owner = metadata.module_owner(rel)
+        probes.append((name, name.encode("utf-8")))
+        full = re.compile(r'"[^"]*(?<![\wЁё.])%s\.%s(?![\wЁё])' % (re.escape(owner or ""), re.escape(name)),
+                          re.IGNORECASE) if owner else None
+        want[name.casefold()].append((key, full))
+    for rel, path in sorted(_bsl_files(dump.root)):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        names = {n for n, nb in probes if nb in data}
+        if not names:
+            continue
+        lines = fileio.read_text(path).split("\n")
+        text = "\n".join(lines)
+        for no in _lines_naming(text, names):
+            raw = lines[no - 1]
+            if raw.lstrip(" \t\xa0").startswith("//"):
+                continue
+            t = bsl.lex_lines([raw])[0]
+            for nm, cands in want.items():
+                if nm not in raw.casefold():
+                    continue
+                for key, full in cands:
+                    if len(res[key]) >= limit:
+                        continue
+                    how = None
+                    if full is not None and full.search(raw):
+                        how = "строка"
+                    elif t.kind == "code":
+                        for m in CALL_RE.finditer(t.blank):
+                            if m.group(1).casefold() != nm:
+                                continue
+                            head = t.blank[:m.start()].rstrip()
+                            if not head.endswith("."):
+                                continue
+                            qm = re.search(r"(\.?)\s*(" + bsl.IDENT + r")\s*$", head[:-1])
+                            if qm is None or (not qm.group(1) and qm.group(2).strip().casefold() not in commons and
+                                              qm.group(2).strip().casefold() not in MANAGERS):
+                                how = "переменная"
+                                break
+                    if how:
+                        name = _enclosing(lines, no)
+                        res[key].append({"title": "%s.%s" % (metadata.module_title(rel), name or "<тело модуля>"),
+                                         "line": no, "how": how})
+    return res
+
+
+def _lines_naming(text, names):
+    """Sorted 1-based numbers of the lines where one of the names occurs."""
+    found = set()
+    for n in names:
+        i = text.find(n)
+        while i >= 0:
+            found.add(i)
+            i = text.find(n, i + len(n))
+    out, line, pos = [], 1, 0
+    for i in sorted(found):
+        line += text.count("\n", pos, i)
+        pos = i
+        if not out or out[-1] != line:
+            out.append(line)
+    return out
+
+
+def _enclosing(lines, no):
+    """Name of the method around line no (a declaration above it before any end of a method), or None - module body.
+    Declarations and ends start their own line outside a string literal, so the raw lines are enough."""
+    for k in range(no - 1, -1, -1):
+        m = DECL_START_RE.match(lines[k])
+        if m:
+            return m.group(1)
+        if k < no - 1 and END_RE.match(lines[k]):
+            return None
+    return None
+
+
+def _dyn_module(code, name):
+    """The module of ОбщийМодуль("X").<name>( in a code line (strings kept), casefold, or "?"."""
+    m = re.search(r'(?:ОбщийМодуль|CommonModule)\s*\(\s*"([^"]+)"\s*\)\s*\.\s*%s\s*\(' % re.escape(name), code,
+                  re.IGNORECASE)
+    return m.group(1).strip().casefold() if m else "?"
+
+
+def _files(root, folder, suffix):
+    """Files with the suffix right in a top folder of a dump (its name in any case)."""
+    try:
+        tops = [e for e in os.scandir(root) if e.is_dir() and e.name.casefold() == folder]
+    except OSError:
+        return []
+    out = []
+    for top in tops:
+        out.extend(e.path for e in os.scandir(top.path) if e.is_file() and e.name.casefold().endswith(suffix))
+    return sorted(out)
+
+
+def _bsl_files(root):
+    """(rel, path) of every .bsl module of a dump: os.scandir without the per-entry link checks of os.walk, and
+    without the Templates folders (no modules there, a quarter of the 45 000 folders of UT)."""
+    stack = [(root, "")]
+    while stack:
+        folder, rel = stack.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for e in entries:
+            if e.is_dir(follow_symlinks=False):
+                if e.name.casefold() not in SKIP_DIRS:
+                    stack.append((e.path, rel + e.name + "/"))
+            elif e.name.casefold().endswith(".bsl"):
+                yield rel + e.name, e.path
+
+
+def _xml_callers(dump, path, title, xml_want, add):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"CommonModule." not in data:
+        return
+    text = data.decode("utf-8", "replace")
+    rel = metadata.norm_rel(os.path.relpath(path, dump.root))
+    obj = os.path.splitext(os.path.basename(path))[0]
+    for m in refs.XML_HANDLER_RE.finditer(text):
+        val = m.group(2).strip()
+        if not val.casefold().startswith("commonmodule."):
+            continue
+        key = xml_want.get(val[len("CommonModule."):].casefold())
+        if key is not None:
+            add(key, rel, None, "%s.%s" % (title, obj), text.count("\n", 0, m.start()) + 1)
+
+
+def vendor_calls(dump, targets):
+    """Counts of vendor_callers: {(module rel key, method casefold): n} (calls.vendor_still_calls)."""
+    return {k: v["calls"] for k, v in vendor_callers(dump, targets).items()}
+
+
+def compare_callers(old, new, cfg_old=None, cfg_new=None):
+    """(lost, appeared) between the callers of one method in old and new (vendor_callers). A caller is the same when
+    the file and the method match or, when the caller method is gone from its file on the other side, a method of the
+    same name calls it elsewhere (the vendor moved the method to another module) or another method of the same file
+    calls it there (the vendor renamed or split the method: ПлатежныйКалендарь.ПеренестиЗаявкиСервер ->
+    ПеренестиОбъектыОплатыСервер). A method still in its file that stopped calling is lost whatever its namesakes
+    elsewhere do (ПриЗаписи of one record set does not stand for another's)."""
+    def gone(dump, c):
+        return dump is None or not c["method"] or dump.find_method(c["file"], c["method"]) is None
+
+    def unmatched(side, other, dump):
+        names = {k[1] for k in other if k[1]}
+        fresh = [(k, c) for k, c in side.items() if k not in other]
+        other_fresh = {k[0] for k in other if k not in side}
+        out = []
+        for k, c in fresh:
+            if k[1] and gone(dump, c) and (k[1] in names or k[0] in other_fresh):
+                continue
+            out.append(c)
+        return out
+    return unmatched(old, new, cfg_new), unmatched(new, old, cfg_old)
+
+
+def fresh_calls(cfg_old, cfg_new, caller):
+    """Calls the caller method makes in new and did not make in old, as written (ОбщийМодуль.Метод), in the order of
+    the new body - what the vendor calls there now; None when the method is gone from its module in new, [] for the
+    module body or an XML handler."""
+    if not caller["method"]:
+        return []
+    mod_new = cfg_new.module(caller["file"])
+    m_new = mod_new.find(caller["method"]) if mod_new is not None else None
+    if m_new is None:
+        return None
+    mod_old = cfg_old.module(caller["file"])
+    m_old = mod_old.find(caller["method"]) if mod_old is not None else None
+
+    def shown(mod, meth):
+        out = OrderedDict()
+        a, b = mod.tok_range(meth)
+        for c in bsl.extract_calls(mod.toks, a, b):
+            chain = [x for x in c["chain"] if x != "@module"]
+            out.setdefault(".".join(chain + [c["name"]]).casefold(), ".".join(chain + [c["name"]]))
+        return out
+    got_old = shown(mod_old, m_old) if m_old is not None else {}
+    return [v for k, v in shown(mod_new, m_new).items() if k not in got_old]
+
+
+def reaches(dump, rel, method, target_rel, target, depth=REACH_DEPTH, budget=REACH_BUDGET):
+    """The chain of vendor methods by which `method` of module `rel` reaches `target` of `target_rel` in `dump` within
+    `depth` calls - [title of each method on the way, the target excluded] - or None. Followed: methods of the same
+    module (bare, ЭтотОбъект. / ЭтаФорма.), of common modules (by name or ОбщийМодуль("X")) and of managers
+    (Документы.X.Метод); the same module first, at most `budget` methods visited. A real case, form
+    РеализацияТоваровУслуг in 11.5.27: ДоговорПриИзмененииЗавершение -> ДоговорПриИзмененииЗавершениеСервер ->
+    ЗаполнитьЦеныПоСоглашениюНаСервере -> ЗаполнитьЦеныПоСоглашениюСервер - the vendor put two wrappers in between, the
+    path still runs the target."""
+    goal = (metadata.rel_key(target_rel), target.casefold())
+    commons = dump.common_modules()
+    start = (metadata.norm_rel(rel), method)
+    seen = {(metadata.rel_key(start[0]), method.casefold())}
+    level = [(start, [])]
+    for _ in range(depth):
+        nxt = []
+        for (mrel, mname), path in level:
+            mod = dump.module(mrel)
+            meth = mod.find(mname) if mod is not None else None
+            if meth is None:
+                continue
+            here = path + ["%s.%s" % (metadata.module_title(mrel), meth.name)]
+            a, b = mod.tok_range(meth)
+            local, remote = [], []
+            for c in bsl.extract_calls(mod.toks, a, b):
+                chain = c["chain"]
+                if not chain or (len(chain) == 1 and chain[0].casefold() in refs.SELF_QUALIFIERS):
+                    local.append((mrel, c["name"]))
+                elif len(chain) == 1 and chain[0].casefold() in commons:
+                    remote.append((metadata.common_module_rel(commons[chain[0].casefold()]), c["name"]))
+                elif len(chain) == 2 and chain[0] == "@module" and chain[1].casefold() in commons:
+                    remote.append((metadata.common_module_rel(commons[chain[1].casefold()]), c["name"]))
+                elif len(chain) == 2 and chain[0].casefold() in metadata.COLL2KIND:
+                    remote.append((metadata.manager_module_rel(metadata.COLL2KIND[chain[0].casefold()], chain[1]),
+                                   c["name"]))
+            for callee in local + remote:
+                key = (metadata.rel_key(callee[0]), callee[1].casefold())
+                if key == goal:
+                    return here
+                if key in seen or len(seen) >= budget:
+                    continue
+                seen.add(key)
+                nxt.append((callee, here))
+        level = nxt
+    return None
+
+
+def instead(fresh, target_owner, cfg_new, caller, limit=3):
+    """What to show as «вызывает вместо него»: the fresh calls of configuration methods - of a common module, a
+    manager (Документы.X.Метод) or the caller's own module - those of the target's own common module or object
+    first."""
+    commons = cfg_new.common_modules()
+    mod = cfg_new.module(caller["file"])
+    keep = []
+    for v in fresh:
+        parts = v.split(".")
+        if (len(parts) == 2 and parts[0].casefold() in commons) or (
+                len(parts) == 3 and parts[0].casefold() in MANAGERS) or (
+                len(parts) == 1 and mod is not None and mod.find(parts[0]) is not None):
+            keep.append(v)
+    own = "." + (target_owner or "").casefold() + "."
+    return sorted(keep, key=lambda v: 0 if target_owner and own in "." + v.casefold() else 1)[:limit]
+
+
+def _platform_invoked(ctx, r):
+    """Why the platform itself runs the target in new whatever the BSL callers (an event handler), or None."""
+    if r["source"] == "callType":
+        return "обработчик события формы"
+    mk = r["mkind"]
+    if mk in refs.IMPLICIT_KINDS and (r["target"] or "").casefold() in (bsl.EVENTS | refs.EXTRA_EVENTS):
+        return "событие платформы"
+    if mk == "form":
+        f_new = ctx.form(ctx.cfg_new, metadata.form_xml_rel(r["_rel_new"]))
+        bound = forms.bound_to(f_new.root, r["target"]) if f_new is not None else []
+        if bound:
+            return "обработчик события формы (%s)" % ", ".join(bound[:3])
+    return None
+
+
+def _lost_text(c):
+    text = "%s (old стр. %d" % (c["title"], c["line_old"])
+    if c.get("method_in_new") is False:
+        text += "; в new этого метода нет"
+    elif c.get("instead"):
+        text += "; в new там вызывает: " + ", ".join(c["instead"])
+    return text + ")"
+
+
+def _shown_callers(cs, limit=SHOWN_CALLERS):
+    parts = ["%s (стр. %d)" % (c["title"], c["line"]) for c in cs[:limit]]
+    if len(cs) > limit:
+        parts.append("и ещё %d" % (len(cs) - limit))
+    return ", ".join(parts)
+
+
+def mark_callers(ctx, rows):
+    """vendor_calls {old, new} and the callers that went away for every interception whose base method is in both
+    releases: CALLERS_LOST when some vendor callers of old are gone in new, TARGET_UNCALLED when all of them are and
+    the platform does not run the method as an event handler and new names it neither through a variable nor in a
+    string (vendor_mentions - then CALLERS_LOST). TARGET_DEPRECATED stays a risk only while the vendor does not call
+    the method in new. One pass over each vendor dump for all targets."""
     if ctx.cfg_old is None:
         return
-    dep = [r for r in rows if "TARGET_DEPRECATED" in r["flags"] and r["source"] == "annotation" and r["target"]]
-    if not dep:
+    live = [r for r in rows if r.get("_t_new") and r.get("_t_old")]
+    if not live:
         return
-    targets = [(r["module"], r["target"]) for r in dep]
-    c_old, c_new = vendor_calls(ctx.cfg_old, targets), vendor_calls(ctx.cfg_new, targets)
-    for r in dep:
-        key = (metadata.rel_key(r["module"]), r["target"].casefold())
-        r["vendor_calls"] = {"old": c_old.get(key, 0), "new": c_new.get(key, 0)}
-        if r["vendor_calls"]["old"] and not r["vendor_calls"]["new"]:
-            r["flags"].append("TARGET_UNCALLED")
-            r["notes"].append("[риск] вызовов метода в коде вендора: old %d, new 0 — перехват не выполнится"
-                              % r["vendor_calls"]["old"])
-        elif r["vendor_calls"]["new"] and r["deprecated"]["grade"] == "risk":
+    t_old = [(r["_rel_old"], r["target_old"]) for r in live]
+    t_new = [(r["_rel_new"], r["target"]) for r in live]
+    with ThreadPoolExecutor(2) as pool:  # mostly file reads: the two dumps overlap
+        f_old = pool.submit(vendor_callers, ctx.cfg_old, t_old)
+        c_new = vendor_callers(ctx.cfg_new, t_new)
+        c_old = f_old.result()
+    # before calling a method dead, look for a call through a variable or a name in a string (separate pass, few)
+    dead = [t for t, to in zip(t_new, t_old) if c_new[(metadata.rel_key(t[0]), t[1].casefold())]["calls"] == 0
+            and c_old[(metadata.rel_key(to[0]), to[1].casefold())]["calls"] > 0]
+    mentions = vendor_mentions(ctx.cfg_new, dead) if dead else {}
+    for r in live:
+        o = c_old[(metadata.rel_key(r["_rel_old"]), r["target_old"].casefold())]
+        n = c_new[(metadata.rel_key(r["_rel_new"]), r["target"].casefold())]
+        if not o["calls"] and not n["calls"]:
+            continue
+        r["vendor_calls"] = {"old": o["calls"], "new": n["calls"]}
+        r["vendor_callers"] = {"old": len(o["callers"]), "new": len(n["callers"])}
+        lost, appeared = compare_callers(o["callers"], n["callers"], ctx.cfg_old, ctx.cfg_new)
+        _, owner = metadata.module_owner(r["_rel_new"])
+        new_names = {k[1] for k in n["callers"] if k[1]}
+        items, deeper = [], []
+        for c in lost:
+            item = {"file": c["file"], "method": c["method"], "title": c["title"], "line_old": c["line"]}
+            fresh = fresh_calls(ctx.cfg_old, ctx.cfg_new, c)
+            if fresh is None:
+                item["method_in_new"] = False
+            elif any(f.rsplit(".", 1)[-1].casefold() in new_names for f in fresh):
+                # the method now calls a vendor caller of the target (the body moved there, the method is a
+                # wrapper): the path is still there
+                continue
+            elif c["method"] and (via := reaches(ctx.cfg_new, c["file"], c["method"], r["_rel_new"],
+                                                 r["target"])) is not None:
+                # the vendor put wrappers between the caller and the target: the path still runs it, deeper
+                deeper.append({"file": c["file"], "method": c["method"], "title": c["title"], "line_old": c["line"],
+                               "via": via[1:]})
+                continue
+            else:
+                shown = instead(fresh, owner if r["mkind"] in ("common", "manager") else None, ctx.cfg_new, c)
+                if shown:
+                    item["instead"] = shown
+            items.append(item)
+        lost = items
+        if deeper:
+            r["callers_moved_deeper"] = deeper
+            r["notes"].append("[инфо] вызов из %s вендор увёл глубже — цель по-прежнему вызывается: %s" % (
+                ", ".join(d["title"] for d in deeper[:SHOWN_CALLERS]),
+                "; ".join(" → ".join([d["title"]] + d["via"] + [r["target"]]) for d in deeper[:SHOWN_CALLERS])))
+        if lost:
+            r["callers_lost"] = lost
+            if appeared:
+                r["callers_new"] = [{"file": c["file"], "method": c["method"], "title": c["title"],
+                                     "line_new": c["line"]} for c in appeared]
+            where = "; ".join(_lost_text(c) for c in lost[:SHOWN_CALLERS])
+            if len(lost) > SHOWN_CALLERS:
+                where += "; и ещё %d" % (len(lost) - SHOWN_CALLERS)
+            platform = _platform_invoked(ctx, r) if not n["calls"] else None
+            seen = mentions.get((metadata.rel_key(r["_rel_new"]), r["target"].casefold())) if not n["calls"] else None
+            if seen:
+                r["vendor_mentions"] = seen
+            if not n["calls"] and platform is None and not seen:
+                r["flags"].append("TARGET_UNCALLED")
+                r["notes"].append("[риск] вызовов метода в коде вендора: old %d, new 0 — перехват не выполнится; "
+                                  "перестали вызывать: %s — найти, что вендор вызывает вместо него, и перенести "
+                                  "перехват туда" % (o["calls"], where))
+            else:
+                r["flags"].append("CALLERS_LOST")
+                r["notes"].append("[риск] код вендора в new перестал вызывать метод из: %s (вызовов old %d → new %d%s)"
+                                  " — на этом пути доработка больше не выполняется: проверить, что вендор вызывает "
+                                  "там вместо него%s" % (
+                                      where, o["calls"], n["calls"],
+                                      "; новые вызовы: " + _shown_callers(appeared) if appeared else "",
+                                      "; метод по-прежнему вызывает платформа — " + platform if platform else
+                                      "; прямых вызовов в new нет, но метод упоминается через переменную или строку: "
+                                      + ", ".join("%s (стр. %d, %s)" % (x["title"], x["line"], x["how"]) for x in seen)
+                                      + " — вызывается ли он там, проверить" if seen else ""))
+        if "TARGET_DEPRECATED" not in r["flags"]:
+            continue
+        if n["calls"] and r["deprecated"]["grade"] == "risk":
             # the vendor marks it obsolete but still calls it in new: the interceptor runs, nothing to do now
             r["deprecated"]["grade"] = "info"
-            r["notes"] = [n.replace("[риск] вендор пометил", "[инфо] вендор пометил", 1)
+            r["notes"] = [x.replace("[риск] вендор пометил", "[инфо] вендор пометил", 1)
                           .replace(": найти, что вендор вызывает вместо него, и перенести перехват туда", "", 1)
-                          for n in r["notes"]]
+                          for x in r["notes"]]
             r["notes"].append("[инфо] вендор сам вызывает метод в new (вызовов в коде вендора: %d) — перехват "
                               "выполняется, устаревание не срочно" % r["vendor_calls"]["new"])
 
@@ -675,7 +1113,7 @@ def main(argv=None):
     for n, r in enumerate(rows, 1):
         r["id"] = n
         check_row(ctx, r)
-    mark_uncalled(ctx, rows)
+    mark_callers(ctx, rows)
     groups = check_groups(ctx, rows)
     dead = dead_code(ctx, rows)
     elapsed = time.time() - t0

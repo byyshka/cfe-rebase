@@ -7,8 +7,9 @@
 Paths come from the registry of databases (registry.py). Steps: check the vendor dumps of both releases; run the
 registry's dump command (an external program: cfe-rebase knows nothing about the 1C platform) unless --no-dump;
 make the work copy - a copy of the extension dump under git with the commit "before: <db> <from>" - unless it exists
-already (then it is left untouched); run control_rebase, interceptors, calls, queries, bodies, borrowed and registers into
-<reports>/prepare-<run_id[:8]>/<tool>/; merge their findings into an adaptation plan (plan.py: plan.json, plan.md);
+already (then it is left untouched); run control_rebase, interceptors, calls, queries, bodies, borrowed, registers and
+names into <reports>/prepare-<run_id[:8]>/<tool>/; merge their findings into an adaptation plan (plan.py: plan.json,
+plan.md; of names only LIST_QUERY_FIELD_MISSING and LIST_FIELD_NOT_LOADED);
 print one screen and write the same data to prepare.json next to them.
 
 Exit code: 0 when every tool ran (conflicts are findings, not errors), 2 on bad input, 3 when the dump command, git or
@@ -44,9 +45,9 @@ from .control_rebase import VERDICTS
 
 BAD_INPUT = 2
 FAILED = 3
-TOOLS = ("control_rebase", "interceptors", "calls", "queries", "bodies", "borrowed", "registers")
+TOOLS = ("control_rebase", "interceptors", "calls", "queries", "bodies", "borrowed", "registers", "names")
 REPORT_NAMES = {"control_rebase": "report", "interceptors": "interceptors", "calls": "calls", "queries": "queries",
-                "bodies": "bodies", "borrowed": "borrowed", "registers": "registers"}
+                "bodies": "bodies", "borrowed": "borrowed", "registers": "registers", "names": "names"}
 GIT_USER = ("cfe-rebase", "noreply")
 TAIL_LINES = 20
 DUMP_TIMEOUT_ENV = "CFE_REBASE_DUMP_TIMEOUT"
@@ -109,7 +110,7 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
     rows = data["interceptors"]["registry"]
     calls = [f for f in data["calls"]["findings"] if f["flags"]]
     plan = plan_mod.build(ctl, data["bodies"], data["interceptors"], data["calls"], data["queries"], data["borrowed"],
-                          data["registers"])
+                          data["registers"], data["names"])
     plan_json, plan_md = os.path.join(folder, "plan.json"), os.path.join(folder, "plan.md")
     with io.open(plan_json, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(plan, fh, ensure_ascii=False, indent=1)
@@ -135,6 +136,8 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
             f["check"] for f in data["borrowed"]["findings"]).items()))},
         "registers": {"findings": len(data["registers"]["findings"]), "checks": dict(sorted(Counter(
             f.get("check", "CHANGED") for f in data["registers"]["findings"]).items()))},
+        "names": {"findings": len(data["names"]["findings"]), "checks": dict(sorted(Counter(
+            f["check"] for f in data["names"]["findings"]).items()))},
         "plan": {"counts": plan["counts"], "hidden": sum(plan["hidden"].values()), "json": plan_json, "md": plan_md,
                  "must_fix": [x for x in plan["items"] if x["group"] == "MUST_FIX"]},
         "reports": reports,
@@ -169,6 +172,7 @@ def screen(res):
             res["bodies"]["copies"], res["bodies"].get("calltype", 0), res["bodies"]["vendor_changed"]),
         "borrowed: находок %d%s" % (res["borrowed"]["findings"], _flags_text(res["borrowed"]["checks"])),
         "registers: находок %d%s" % (res["registers"]["findings"], _flags_text(res["registers"]["checks"])),
+        "names: находок %d%s" % (res["names"]["findings"], _flags_text(res["names"]["checks"])),
     ]
     plan = _load(res["plan"]["json"])
     lines.extend(plan_mod.screen_lines(plan))
@@ -184,7 +188,7 @@ def main(argv=None):
     fileio.console_utf8()
     ap = argparse.ArgumentParser(description="Подготовка к адаптации расширений базы из реестра: выгрузка, рабочая "
                                              "копия под git, control_rebase / interceptors / calls / queries / "
-                                             "bodies / borrowed / registers и план адаптации")
+                                             "bodies / borrowed / registers / names и план адаптации")
     ap.add_argument("--db", required=True, help="база из реестра (id или alias)")
     ap.add_argument("--to", required=True, help="релиз, на который переносим (ключ cfe_rebase.releases)")
     ap.add_argument("--from", dest="from_", help="релиз, под который написаны расширения; по умолчанию "
@@ -348,7 +352,7 @@ def _copy_error(exc):
 
 
 def _analyze(r, folder, work, only, say):
-    """The seven tools of TOOLS into <folder>/<tool>/; {tool: {json, md}}."""
+    """The eight tools of TOOLS into <folder>/<tool>/; {tool: {json, md}}."""
     dumps = ["--config-old", r["old"], "--config-new", r["new"]]
     argvs = {
         "control_rebase": ["--ext", r["ext"], "--old", r["old"], "--new", r["new"]] +
@@ -359,6 +363,7 @@ def _analyze(r, folder, work, only, say):
         "bodies": ["--ext-root", r["ext"]] + dumps + (["--ext", only] if only else []),
         "borrowed": ["--ext-root", r["ext"]] + dumps + (["--ext", only] if only else []),
         "registers": ["--ext-root", r["ext"]] + dumps + (["--ext", only] if only else []),
+        "names": ["--ext-root", r["ext"]] + dumps + (["--ext", only] if only else []),
     }
     reports = {}
     for tool in TOOLS:

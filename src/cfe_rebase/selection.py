@@ -7,7 +7,7 @@
 
 The same rules serve the MCP server (mcp_server: the check_* tools and list_interceptors filter, rank and compare
 with them before the answer is cut to size) and this command, which reads a report already on disk - for example one
-of the seven reports of `prepare` - instead of running the check again.
+of the eight reports of `prepare` - instead of running the check again.
 
 Reports: calls, queries, borrowed, reads, registers, names, interceptors (rows of `registry`), lint (rows of
 `issues`).
@@ -58,9 +58,9 @@ BORROWED_ORDER = ("OBJECT_REMOVED", "OBJECT_RENAMED", "REMOVED", "RENAMED", "TYP
 BORROWED_LEVEL = {"XML_UNREADABLE": "risk", "LIST_CHANGED": "risk", "NOT_IN_VENDOR": "info"}  # the rest: error
 # interceptors: the flags the adaptation plan calls MUST_FIX, CLARIFY and hides (plan.INT_MUST / INT_CLARIFY)
 INTERCEPTOR_ORDER = ("MISSING_BASE", "TARGET_RENAMED", "TARGET_UNCALLED", "SIGNATURE_MISMATCH", "SIGNATURE_CHANGED",
-                     "CONTROL_MISMATCH", "CONFLICT", "OVERRIDDEN", "OVERRIDDEN?", "BINDING_CHANGED", "NEW_BASE",
-                     "TARGET_DEPRECATED", "DIRECTIVE_MISMATCH", "DEAD_BINDING")
-INTERCEPTOR_LEVEL = dict({f: "error" for f in INTERCEPTOR_ORDER[:6]}, **{f: "risk" for f in INTERCEPTOR_ORDER[6:11]})
+                     "CONTROL_MISMATCH", "CALLERS_LOST", "CONFLICT", "OVERRIDDEN", "OVERRIDDEN?", "BINDING_CHANGED",
+                     "NEW_BASE", "TARGET_DEPRECATED", "DIRECTIVE_MISMATCH", "DEAD_BINDING")
+INTERCEPTOR_LEVEL = dict({f: "error" for f in INTERCEPTOR_ORDER[:6]}, **{f: "risk" for f in INTERCEPTOR_ORDER[6:12]})
 
 
 def _interceptor_level(row):
@@ -155,7 +155,7 @@ SPECS = {
                      lambda r: _l(r.get("flags"))),
     "names": (("ext", "module", "how", "name", "check"),
               lambda r: r.get("level") if r.get("level") in LEVELS else "info",
-              lambda r: 0 if r.get("check") == "GONE_IN_NEW" else 1,
+              lambda r: 0 if r.get("check") in ("GONE_IN_NEW", "LIST_QUERY_FIELD_MISSING") else 1,
               lambda r: [r.get("module"), r.get("form")] + _l(r.get("methods")),
               lambda r: [r.get("form"), r.get("module")],
               lambda r: [r.get("check"), r.get("how"), r.get("level")]),

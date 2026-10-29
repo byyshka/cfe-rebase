@@ -71,7 +71,9 @@ CONTROL_PASS = control_rebase.PASS_VERDICTS  # and the signature fits: control_r
 INTERCEPTOR_FIELDS = ("id", "ext", "module_title", "source", "kind", "target", "target_old", "ext_method", "proceed",
                       "flags", "notes", "ext_directive", "base_directive", "ext_sig", "base_sig_old", "base_sig_new",
                       "ann_line", "ext_line", "base_line_old", "base_line_new", "callType", "owner_kind", "owner",
-                      "event", "own_element", "xml_line", "deprecated", "vendor_calls")
+                      "event", "own_element", "xml_line", "deprecated", "vendor_calls", "vendor_callers",
+                      "callers_lost", "callers_new", "vendor_mentions",
+                      "callers_moved_deeper")
 CALL_FIELDS = ("ext", "module_title", "line", "caller", "call", "args", "target", "flags", "note", "deprecated", "copy",
                "advice", "owner")
 QUERY_FIELDS = ("part", "kind", "sev", "ext", "where", "line", "ref", "note", "old")
@@ -515,8 +517,19 @@ def list_interceptors(ext_root: list[str] | None = None, config_old: str | None 
     TARGET_DEPRECATED — вендор пометил базовый метод устаревшим в new, deprecated {new,
     old — почему: область или комментарий, grade: risk — устарел только в new, info — и в old или вендор сам вызывает
     его в new (vendor_calls.new > 0)}, TARGET_UNCALLED —
-    устаревший метод, который код вендора в old вызывал, а в new нет: перехват не выполнится, vendor_calls {old, new} —
-    счёт вызовов по тексту модулей вендора), notes, директивы, сигнатуры (base_sig_old — только если отличается от new),
+    метод, который код вендора в old вызывал, а в new — нигде (и платформа не вызывает его как обработчик события):
+    перехват не выполнится, CALLERS_LOST — часть вызовов из кода вендора old в new пропала (АМ: проведение
+    ТоварыКОтгрузке перестало вызывать СкладыСервер.ДобавитьВОчередьФормированияРасходныхОрдеров): на этих путях
+    доработка больше не выполняется; у обоих callers_lost [{file, method, title, line_old, instead — что этот метод в
+    new вызывает такого, чего не вызывал в old, method_in_new: false — метода в new нет}], callers_new — новые места
+    вызова; vendor_calls {old, new} — счёт вызовов по тексту модулей вендора, vendor_callers {old, new} — число
+    вызывающих методов; считается для каждого перехвата, у которого базовый метод есть в old и new; если прямых
+    вызовов в new нет, но метод упоминается через переменную (МенеджерОбъекта.Метод) или полным именем в строке
+    (ИмяМетода отложенного задания) — CALLERS_LOST вместо TARGET_UNCALLED и vendor_mentions [{title, line, how}];
+    вызывающий, который в new доходит до цели через методы вендора не глубже трёх вызовов (свой модуль, общие
+    модули, менеджеры), не потерян — callers_moved_deeper [{file, method, title, line_old, via}]),
+    notes,
+    директивы, сигнатуры (base_sig_old — только если отличается от new),
     номера строк: ann_line / ext_line — в модуле расширения, base_line_old / base_line_new — в модулях вендора;
     у callType — form (Form.xml), xml_line, owner, event. dead_code — отдельный список (category UNBOUND,
     COMMENTED_ANNOTATION, DEAD_BINDING_OWN_FORMS). summary — счёты флагов по всем строкам, даже при only_flagged.
@@ -524,7 +537,8 @@ def list_interceptors(ext_root: list[str] | None = None, config_old: str | None 
     нет, это не «формы нет»; есть только при непустом списке, тогда же summary.unreadable_forms.
     Что изменил вендор в теле метода — method_diff; полный реестр с группами целей — report.md.
     Выборка — общие параметры, описаны в конце: flag — флаги строки; уровни severity: error — MISSING_BASE,
-    TARGET_RENAMED, TARGET_UNCALLED, SIGNATURE_MISMATCH, SIGNATURE_CHANGED, CONTROL_MISMATCH; risk — CONFLICT, OVERRIDDEN,
+    TARGET_RENAMED, TARGET_UNCALLED, SIGNATURE_MISMATCH, SIGNATURE_CHANGED, CONTROL_MISMATCH; risk — CALLERS_LOST,
+    CONFLICT, OVERRIDDEN,
     OVERRIDDEN?, BINDING_CHANGED, NEW_BASE, TARGET_DEPRECATED (устарел только в new); info — остальное и строки без флагов; ключ — ext|module|kind|target|ext_method|flags."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
               "order": order, "only_flagged": only_flagged, "db": db, "to": to, "from_release": from_release,
@@ -1187,7 +1201,8 @@ def check_registers(ext_root: list[str] | None = None, config_old: str | None = 
                     body, _from_registry(inputs, DUMP_KEYS, DUMP_KEYS))
 
 
-NAME_FIELDS = ("ext", "form", "how", "name", "check", "level", "line", "lines", "methods", "detail")
+NAME_FIELDS = ("ext", "form", "how", "name", "check", "level", "line", "lines", "methods", "detail", "needed_by",
+               "new_in_new")
 
 
 def check_names(ext_root: list[str] | None = None, config_old: str | None = None, config_new: str | None = None,
@@ -1205,14 +1220,30 @@ def check_names(ext_root: list[str] | None = None, config_old: str | None = None
     attribute (ЭтотОбъект.X / ЭтаФорма.X — реквизит формы или переменная модуля; и имя без квалификатора, которое в
     old было реквизитом формы или переменной модуля, а не параметром и не Перем метода), object (Объект.X — реквизит
     или табличная часть объекта основного реквизита; стандартные реквизиты не сравниваются), parameter (Параметры.X;
-    стандартные параметры не сравниваются). Вызовы (X(…)) — не сюда, это check_calls.
-    items — по имени в модуле: ext, form (Документ.X.Форма.Y), path (модуль формы), how, name, check, level, line
-    (первая строка), lines, methods, detail. check: GONE_IN_NEW — в форме вендора old было, в new нет, расширение
-    само не добавляет (error; risk — модуль формы new всё ещё называет это имя: возможно, создаётся кодом; поле
-    объекта, переименованное вендором с тем же uuid, — в detail); NOT_IN_VENDOR — нет ни в old, ни в new, ни в
+    стандартные параметры не сравниваются), list — поле динамического списка вендора, чей запрос расширение
+    подменяет. Вызовы (X(…)) — не сюда, это check_calls.
+    items — по имени в модуле: ext, form (Документ.X.Форма.Y), path (модуль формы; у list из Form.xml — Form.xml),
+    how, name, check, level, line (первая строка), lines, methods, detail; у list ещё needed_by, new_in_new. check:
+    GONE_IN_NEW — в форме вендора old было, в new нет, расширение само не добавляет (error; risk — модуль формы new
+    всё ещё называет это имя: возможно, создаётся кодом; поле объекта, переименованное вендором с тем же uuid, — в detail); NOT_IN_VENDOR — нет ни в old, ни в new, ни в
     добавлениях расширения (info: создаётся кодом, чужое или опечатка; risk — имя есть в BaseForm расширения: вендор
-    убрал его ещё до old); XML_UNREADABLE — Form.xml не разбирается, форма не проверена (risk). summary — счёты по
-    проверкам и уровням, форм и имён.
+    убрал его ещё до old); XML_UNREADABLE — Form.xml не разбирается, форма не проверена (risk);
+    LIST_QUERY_FIELD_MISSING — расширение подменяет запрос динамического списка формы вендора — кодом
+    (<Список>.ТекстЗапроса / QueryText = литерал, их сцепление или переменная из них в том же методе; СтрЗаменить с
+    литералами применяется) или своим ManualQuery-запросом в Form.xml (отличным от BaseForm), — а в запросе нет поля,
+    которое нужно форме вендора new: DataPath элемента <Список>.<Поле>, UseAlways списка, чтение
+    Элементы.<Таблица>.ТекущиеДанные.<Поле> / Элемент.ТекущиеДанные.<Поле> в модуле формы new. Платформа молча
+    убирает колонку, код вендора падает «Поле объекта не обнаружено». name — <Список>.<Поле>, line — строка
+    присваивания (или атрибута списка в Form.xml расширения), needed_by — где поле нужно, new_in_new — форма old его
+    не требовала; error, если поле новое в new, risk — если и old его требовала (колонки не было и до обновления).
+    Не сравниваются поля, которых нет и в запросе вендора new (их делает код), DefaultPicture, запрос с «*»; текст,
+    собранный не из литералов (вызов, правка вендорского ТекстЗапроса через СтрЗаменить), не судится. В плане
+    prepare — «исправить» (error) / «проверить» (risk). LIST_FIELD_NOT_LOADED (всегда risk) — у такого списка
+    расширение меняет и UseAlways (Form.xml против BaseForm), а поле UseAlways вендора new, которое запрос расширения
+    выбирает, не загружают ни UseAlways расширения, ни его видимые элементы: если UseAlways расширения заменяет
+    вендорский, поля нет в данных строки; заменяет платформа или сливает — статикой не доказано (в плане —
+    «уточнить»); new_in_new — поля не было в UseAlways old. summary — счёты по проверкам и уровням, форм и имён,
+    list_queries / list_queries_unjudged — подменённых запросов списков всего / не судится.
     Выборка — общие параметры, описаны в конце: flag — check, how или level; уровни severity — level находки; ключ
     — ext|module|how|name|check."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
@@ -1240,6 +1271,8 @@ def check_names(ext_root: list[str] | None = None, config_old: str | None = None
                    "levels": dict(sorted(Counter(f["level"] for f in data["findings"]).items())),
                    "forms": data["stats"].get("forms", 0), "names": data["stats"].get("names", 0),
                    "forms_missing_new": data["stats"].get("forms_missing_new", 0),
+                   "list_queries": data["stats"].get("list_queries", 0),
+                   "list_queries_unjudged": data["stats"].get("list_queries_unjudged", 0),
                    "extensions": len(data["extensions"])}
         summary, report = _with_selection(summary, _report(dest, "names"), picked)
         return {"summary": summary, "items": picked["items"], "ranks": picked["ranks"], "report": report}
@@ -1641,18 +1674,19 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
     выполнить команду выгрузки расширений из реестра (cfe_rebase.dump; names — выгрузить эти расширения вместо
     extensions базы), без dump — взять то, что уже лежит в ext; рабочая копия work: если её нет — копия ext под git с
     коммитом «before: <db> <from>», если есть и под git — не трогается (тогда control_rebase сверяет с ней перенос),
-    если есть без git — отказ; прогнать control_rebase, interceptors, calls, queries, bodies, borrowed, registers в
-    <reports>/prepare-<run_id[:8]>/<инструмент>/ (only — одно расширение), свести находки в план адаптации и записать
-    там prepare.json, plan.json, plan.md.
+    если есть без git — отказ; прогнать control_rebase, interceptors, calls, queries, bodies, borrowed, registers,
+    names в <reports>/prepare-<run_id[:8]>/<инструмент>/ (only — одно расширение), свести находки в план адаптации
+    и записать там prepare.json, plan.json, plan.md.
 
     summary — экран prepare: db, from, to, ext, ext_newest, dumped, work (path, state created | existing, commit,
     compared), verdicts control_rebase, interceptors (rows, flagged, flags), calls (findings — с флагами, flags),
     queries (findings, unjudged), bodies (copies, vendor_changed, calltype — из них копий callType=Override),
-    borrowed (findings, checks), registers (findings), plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько находок
+    borrowed (findings, checks), registers (findings), names (findings, checks; в план идёт только
+    LIST_QUERY_FIELD_MISSING и LIST_FIELD_NOT_LOADED), plan (MUST_FIX / REVIEW / CLARIFY, hidden — сколько находок
     скрыто как шум). items — пункты MUST_FIX плана: ext, module, module_title, method, what (что произошло и что
     делать). План не покрывает собственные копии СКД и макетов вендора под другим именем и запись в регистры через
     ЗаполнитьЗначенияСвойств или структуру — их сверять по тексту. report — json (prepare.json), plan {json, md} и
-    {json, md} каждого из семи отчётов. Ошибки: bad_input (до любого запуска) — реестр, релиз, рабочая копия без git
+    {json, md} каждого из восьми отчётов. Ошибки: bad_input (до любого запуска) — реестр, релиз, рабочая копия без git
     или не корень своего git-репозитория, рабочая копия внутри ext / old / new или ext внутри рабочей копии,
     dump=True у базы с cfe_rebase.proof_corpus (её ext — эталонная выгрузка: только dump=False); external — команда
     выгрузки или git завершились с ошибкой (хвост вывода — в console), выгрузка не уложилась в
@@ -1674,7 +1708,7 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
                    "ext_newest": res["ext_newest"], "dumped": bool(res["dump"]), "work": res["work"],
                    "verdicts": res["control_rebase"]["verdicts"], "interceptors": res["interceptors"],
                    "calls": res["calls"], "queries": res["queries"], "bodies": res["bodies"], "borrowed": res["borrowed"],
-                   "registers": res["registers"],
+                   "registers": res["registers"], "names": res["names"],
                    "plan": dict(res["plan"]["counts"], hidden=res["plan"]["hidden"])}
         report = dict({"json": res["prepare_json"], "plan": {"json": res["plan"]["json"], "md": res["plan"]["md"]}},
                       **res["reports"])
