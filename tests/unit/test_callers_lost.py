@@ -201,6 +201,37 @@ class Dumps(unittest.TestCase):
         items = plan.build({}, {}, {"registry": [row]}, {"findings": []}, {"findings": []})["items"]
         self.assertEqual([x["group"] for x in items], ["MUST_FIX"])
 
+    def test_replacement(self):
+        # a real case 11.5.17 -> 11.5.27: all 39 lost callers of ОтветственныеЛицаСервер.ЗаполнитьМенеджера call
+        # УстановитьМенеджера of the same module (proven on the data: the manager became the current user)
+        lost = [{"method": "ПартнерПриИзмененииСервер%d" % i,
+                 "instead": ["ОтветственныеЛицаСервер.ЗаполнитьСписокВыбораМенеджера",
+                             "ОтветственныеЛицаСервер.УстановитьМенеджера"] if i % 3 else
+                 ["ОтветственныеЛицаСервер.УстановитьМенеджера"]} for i in range(5)]
+        lost.append({"method": "Удалённый", "method_in_new": False})
+        self.assertEqual(interceptors.replacement(lost, "ОтветственныеЛицаСервер"),
+                         {"method": "ОтветственныеЛицаСервер.УстановитьМенеджера", "callers": 5, "of": 5,
+                          "same_owner": True})
+        # too few callers still there, or no method most of them share: no replacement
+        self.assertIsNone(interceptors.replacement(lost[:2], "ОтветственныеЛицаСервер"))
+        mixed = [{"method": "М%d" % i, "instead": ["Модуль%d.Метод" % i]} for i in range(5)]
+        self.assertIsNone(interceptors.replacement(mixed, "ОтветственныеЛицаСервер"))
+        # another module: reported, not the target's own
+        self.assertFalse(interceptors.replacement(lost, "ДлительныеОперации")["same_owner"])
+
+    def test_plan_replacement_is_a_fix_whatever_the_callers(self):
+        row = {"ext": "Р", "module": "CommonModules/ОтветственныеЛицаСервер/Ext/Module.bsl",
+               "ext_method": "Расш_ЗаполнитьМенеджера", "flags": ["CALLERS_LOST"],
+               "vendor_callers": {"old": 130, "new": 99},
+               "replacement": {"method": "ОтветственныеЛицаСервер.УстановитьМенеджера", "callers": 39, "of": 39,
+                               "same_owner": True}}
+        items = plan.build({}, {}, {"registry": [row]}, {"findings": []}, {"findings": []})["items"]
+        self.assertEqual([x["group"] for x in items], ["MUST_FIX"])
+        self.assertIn("УстановитьМенеджера", " ".join(items[0]["what"]))
+        row["replacement"]["same_owner"] = False
+        items = plan.build({}, {}, {"registry": [row]}, {"findings": []}, {"findings": []})["items"]
+        self.assertEqual([x["group"] for x in items], ["CLARIFY"])
+
 
 if __name__ == "__main__":
     unittest.main()

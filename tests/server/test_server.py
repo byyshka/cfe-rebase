@@ -41,9 +41,11 @@ OBJECT = "Documents/ЗаказПокупателя/Ext/ObjectModule.bsl"
 BOM = b"\xef\xbb\xbf"
 TOOL_NAMES = {"list_interceptors", "method_diff", "rebase_control", "check_control", "port_replace", "check_calls",
               "check_queries", "applied_text", "apply_candidate", "apply_borrow_edit", "prepare", "check_work",
-              "check_borrowed", "check_registers", "check_reads", "check_copies", "check_names"}
+              "check_borrowed", "check_registers", "check_reads", "check_copies", "check_names",
+              "check_template_params"}
 # tools whose answer on the synthetic corpus may have no items: a clean work copy, no borrowed or register findings
-NO_FINDINGS = {"check_work", "check_borrowed", "check_registers", "check_reads", "check_names"}
+NO_FINDINGS = {"check_work", "check_borrowed", "check_registers", "check_reads", "check_names",
+               "check_template_params"}
 # report fields that carry method text: none of them may reach an answer unless asked for
 TEXT_FIELDS = {"hunks", "conflict_blocks", "duplicated_unexplained", "src", "left_new", "added_to_new"}
 
@@ -102,6 +104,7 @@ class ServerTools(unittest.TestCase):
             "check_reads": srv.check_reads([EXT], OLD, NEW, cls.out),
             "check_copies": srv.check_copies([EXT], OLD, NEW, cls.out),
             "check_names": srv.check_names([EXT], OLD, NEW, cls.out),
+            "check_template_params": srv.check_template_params([EXT], OLD, NEW, cls.out),
         }
 
     @classmethod
@@ -647,6 +650,27 @@ class ServerRegistry(unittest.TestCase):
         self.assertFalse(again["summary"]["dumped"])
         only = self.ok(srv.prepare(fx.DB, fx.TO, registry=self.reg, names=[fx.EXT_PRINT], only=fx.EXT_PRINT))
         self.assertEqual(only["summary"]["verdicts"]["REBASED"], 0)
+
+    def test_prepare_out_of_perimeter(self):
+        self.assertNotIn("out_of_perimeter", self.ok(srv.prepare(fx.DB, fx.TO, registry=self.reg))["summary"])
+        base = os.path.join(self.tmp, "all")
+        task = os.path.join(base, fx.TASK)
+        _, ext_all = fx.make_ext_all(task)
+        reg, _ = fx.make(base, db_cfg={"from": fx.FROM, "task_dir": task, "ext_dump": "before\\xml",
+                                       "ext_all": "all\\xml"})
+        res = self.ok(srv.prepare(fx.DB, fx.TO, registry=reg, dump=False))
+        o = res["summary"]["out_of_perimeter"]
+        self.assertEqual((o["ext_all"], o["perimeter"], o["extensions"], o["clean"]),
+                         (ext_all, [fx.EXT_ALL_V2], 3, 1))
+        self.assertEqual([(x["ext"], x["borrowed"]) for x in o["not_applied"]], [(fx.EXT_FOREIGN, 1)])
+        self.assertTrue(o["not_applied"][0]["first"].startswith("COMPAT_MODE"))
+        self.assertEqual([x["ext"] for x in o["control_only"]], [fx.EXT_MAIN])
+        self.assertEqual(o["foreign"], {"error": 1, "risk": 0, "info": 1})
+        datetime.fromisoformat(o["ext_all_newest"])
+        self.assertEqual(set(res["report"]["out_of_perimeter"]), {"borrowed", "control_rebase"})
+        # the outside extensions are not items; the perimeter's dependency on one that will not be applied is
+        self.assertFalse({x["ext"] for x in res["items"]} & {fx.EXT_MAIN, fx.EXT_FOREIGN, fx.EXT_CLEAN})
+        self.assertTrue(any("Синт_Дата" in x["what"][0] for x in res["items"]))
 
     def test_prepare_never_dumps_a_proof_corpus(self):
         reg, task = fx.make(os.path.join(self.tmp, "proof"), db_cfg={

@@ -6,10 +6,12 @@
      "databases": [{"id": "...", "aliases": [...], "extensions": ["<name>" | {"name": "<name>", ...}, ...],
                     "cfe_rebase": {"from": "<release>", "task_dir": "...",
                                    "ext_dump": "old\\xml", "work": "work", "reports": "reports",
-                                   "proof_corpus": true}}]}
+                                   "ext_all": "all\\xml", "proof_corpus": true}}]}
 
 proof_corpus: true marks ext_dump as a reference dump (a proof corpus) that is never re-dumped: prepare runs on it
 only without the dump (--no-dump / dump=False); a missing key allows the dump.
+ext_all: a dump of ALL extensions of the database (no default, relative to task_dir); prepare checks the ones outside
+the task's perimeter (ext_dump) with borrowed and control_rebase. Never dumped by prepare.
 Only these keys are read. Everything else in the file (connection strings, users, passwords) is ignored and never
 appears in a message. The file: --registry, else $CFE_REBASE_REGISTRY, else ~/.cfe-rebase/registry.json.
 """
@@ -121,7 +123,8 @@ def resolve(registry_path=None, db=None, to=None, from_=None, need_old=True):
     else None, never an error. Keys: db_id, from, to, registry, task_dir, ext (dump of the extensions), old, new
     (vendor dumps), work (None while the folder does not exist), work_path (where it is or will be), out (reports),
     names (extensions), dump_cmd (argv with the registry's names, None without cfe_rebase.dump), dump_template,
-    proof_corpus (cfe_rebase.proof_corpus of the database is true: ext_dump is never re-dumped)."""
+    proof_corpus (cfe_rebase.proof_corpus of the database is true: ext_dump is never re-dumped), ext_all (dump of all
+    extensions of the database, None without cfe_rebase.ext_all)."""
     path, data = load(registry_path)
     if not db:
         raise RegistryError("не задана база (--db / db)")
@@ -158,6 +161,10 @@ def resolve(registry_path=None, db=None, to=None, from_=None, need_old=True):
             raise RegistryError("у базы %s нет cfe_rebase.task_dir, а путь cfe_rebase.%s относительный (%s)"
                                 % (db_id, key, value))
         paths[key] = _norm(value, task_dir)
+    ext_all = cfg.get("ext_all") or None
+    if ext_all and not os.path.isabs(os.path.expanduser(str(ext_all))) and not task_dir:
+        raise RegistryError("у базы %s нет cfe_rebase.task_dir, а путь cfe_rebase.ext_all относительный (%s)"
+                            % (db_id, ext_all))
     names = extension_names(entry)
     template = root.get("dump") or None
     ext = paths["ext_dump"]
@@ -168,7 +175,8 @@ def resolve(registry_path=None, db=None, to=None, from_=None, need_old=True):
             "out": paths["reports"], "names": names,
             "dump_cmd": dump_argv(template, db_id, names, os.path.dirname(ext)) if template else None,
             "dump_template": template,
-            "proof_corpus": proof is True or str(proof).strip().casefold() == "true"}
+            "proof_corpus": proof is True or str(proof).strip().casefold() == "true",
+            "ext_all": _norm(ext_all, task_dir) if ext_all else None}
 
 
 def ext_newest(ext_dir):

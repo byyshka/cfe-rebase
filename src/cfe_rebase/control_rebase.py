@@ -436,11 +436,12 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="report and candidates folder, outside every dump")
     ap.add_argument("--work", help="work copy root (same layout as --ext): compare with the hand-made port")
     ap.add_argument("--only", help="only this extension (name from Configuration.xml or folder name)")
+    ap.add_argument("--skip", action="extend", nargs="+", help="skip these extensions (name); repeatable")
     args = ap.parse_args(argv)
     refuse_out_inside(args.out, (("--ext", args.ext), ("--old", args.old), ("--new", args.new), ("--work", args.work)),
                       "control_rebase")
     t0 = time.time()
-    exts = metadata.find_extensions([args.ext], [args.only] if args.only else None)
+    exts = metadata.find_extensions([args.ext], [args.only] if args.only else None, args.skip)
     if not exts:
         sys.exit("no extension dumps found under --ext" + (" for --only %s" % args.only if args.only else ""))
     metadata.check_config(args.old, "--old")

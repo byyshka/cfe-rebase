@@ -9,8 +9,8 @@ The same rules serve the MCP server (mcp_server: the check_* tools and list_inte
 with them before the answer is cut to size) and this command, which reads a report already on disk - for example one
 of the eight reports of `prepare` - instead of running the check again.
 
-Reports: calls, queries, borrowed, reads, registers, names, interceptors (rows of `registry`), lint (rows of
-`issues`).
+Reports: calls, queries, borrowed, reads, registers, names, template-params, interceptors (rows of `registry`), lint
+(rows of `issues`).
 Every finding gets
   level   error | risk | info - how bad it is for the port (LEVELS: per report below); the ranking of a cut answer
           puts error before risk before info, so the rows that matter survive a size limit;
@@ -24,8 +24,9 @@ Filters, all optional and combined with AND: module - substring of the place of 
 the extension root, its title such as Документ.X.МодульОбъекта, the method), case-insensitive, alternatives split by
 «|»; object - a metadata object as a whole name segment (Документ.ЗаказКлиента, ЗаказКлиента or
 Documents/ЗаказКлиента), matched against the object the finding is in or about; flag - any of the flags, checks or
-severities of the finding (calls: OWNER_REMOVED … SIGNATURE_CHANGED and risk / info of it; queries: sev, kind, part,
-old; borrowed, reads, registers, lint: check; names: check, how, level; interceptors: flags); severity - the lowest
+severities of the finding (calls: OWNER_REMOVED … SIGNATURE_CHANGED and risk / info of it, STRUCT_KEY_NEW and error /
+risk of it; queries: sev, kind, part, old; borrowed, reads, registers, lint: check; names: check, how, level;
+template-params: check, sev; interceptors: flags); severity - the lowest
 level to keep (error: errors only, risk: errors and risks, info: everything).
 Extensions renamed between the baseline and the current run (a work copy is renamed «<name>_<release>_<date>_v_…»):
 the MCP server pairs them by the uuid of Configuration when both sides are dumps; otherwise, when exactly one name of
@@ -48,12 +49,12 @@ DELTAS = ("new", "kept", "gone")
 # report name -> MCP tool
 TOOLS = OrderedDict([("calls", "check_calls"), ("queries", "check_queries"), ("borrowed", "check_borrowed"),
                      ("reads", "check_reads"), ("registers", "check_registers"), ("interceptors", "list_interceptors"),
-                     ("lint", "check_work"), ("names", "check_names")])
+                     ("lint", "check_work"), ("names", "check_names"), ("template-params", "check_template_params")])
 ROWS = {"interceptors": "registry", "lint": "issues"}  # the list of findings in <report>.json; the others: findings
 
 CALL_ERRORS = ("OWNER_REMOVED", "OWNER_RENAMED", "REMOVED", "TOO_FEW_ARGS", "TOO_MANY_ARGS", "MISSING",
                "NOT_EXPORT")  # in this order of rank
-BORROWED_ORDER = ("COMPAT_MODE", "OBJECT_REMOVED", "OBJECT_RENAMED", "REMOVED", "RENAMED", "TYPE_CHANGED",
+BORROWED_ORDER = ("COMPAT_MODE", "OBJECT_REMOVED", "OBJECT_RENAMED", "OBJECT_NAME_CLASH", "REMOVED", "RENAMED", "TYPE_CHANGED",
                   "PROPERTY_CHANGED", "LIST_FIELD_LOST", "NAME_CLASH", "XML_UNREADABLE", "LIST_CHANGED", "NOT_IN_VENDOR")
 BORROWED_LEVEL = {"XML_UNREADABLE": "risk", "LIST_CHANGED": "risk", "NOT_IN_VENDOR": "info"}  # the rest: error
 # interceptors: the flags the adaptation plan calls MUST_FIX, CLARIFY and hides (plan.INT_MUST / INT_CLARIFY)
@@ -70,6 +71,8 @@ def _interceptor_level(row):
         levels.append("risk")
     return min(levels, key=LEVELS.index, default="info")
 QUERY_LEVEL = {"ОШИБКА?": "error", "РИСК": "risk"}
+# template-params: the rest is risk (the cell prints empty without an error)
+TEMPLATE_PARAM_INFO = ("VENDOR_GONE", "COPY_OLD_NAME")
 READ_RISK = ("dims_added", "dims_removed", "res_removed", "attrs_removed", "props_changed")
 
 
@@ -93,6 +96,9 @@ def _title(row):
 
 def _calls_level(row):
     flags = set(_l(row.get("flags")))
+    if "STRUCT_KEY_NEW" in flags:  # a row of its own (calls.struct_keys): error or risk by the structure's origin
+        grade = (row.get("struct_key") or {}).get("grade")
+        return grade if grade in LEVELS else "risk"
     if flags - {"SIGNATURE_CHANGED", "CALLS_DEPRECATED"}:
         return "error"
     return "risk" if flags and _risk_call(row) else "info"
@@ -122,7 +128,8 @@ SPECS = {
               lambda r: _first(CALL_ERRORS, _l(r.get("flags"))),
               lambda r: [r.get("module"), r.get("module_title"), r.get("caller")],
               lambda r: [r.get("module_title"), r.get("module"), r.get("target")],
-              lambda r: _l(r.get("flags")) + (["risk" if _risk_call(r) else "info"]
+              lambda r: _l(r.get("flags")) + ([_calls_level(r)] if "STRUCT_KEY_NEW" in _l(r.get("flags")) else
+                                              ["risk" if _risk_call(r) else "info"]
                                               if {"SIGNATURE_CHANGED", "CALLS_DEPRECATED"} & set(_l(r.get("flags")))
                                               else [])),
     "queries": (("ext", "file", "where", "part", "kind", "ref"),
@@ -159,8 +166,14 @@ SPECS = {
               lambda r: [r.get("module"), r.get("form")] + _l(r.get("methods")),
               lambda r: [r.get("form"), r.get("module")],
               lambda r: [r.get("check"), r.get("how"), r.get("level")]),
+    "template-params": (("ext", "template", "check"),
+                        lambda r: "info" if r.get("check") in TEMPLATE_PARAM_INFO else "risk",
+                        lambda r: 0 if r.get("ext") else 1,
+                        lambda r: [r.get("rel")] + [x.get("rel") for x in _l(r.get("places")) + _l(r.get("templates"))],
+                        lambda r: [r.get("template"), r.get("rel")],
+                        lambda r: [r.get("check"), r.get("sev")]),
     "lint": (("ext", "file", "check"),
-             lambda r: "error" if r.get("severity") == "error" else "info",
+             lambda r: r.get("severity") if r.get("severity") in LEVELS else "info",
              lambda r: 0,
              lambda r: [r.get("file"), r.get("path")],
              lambda r: [r.get("file")],

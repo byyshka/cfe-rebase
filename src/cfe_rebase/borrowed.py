@@ -19,6 +19,16 @@ section attribute whose type (with string length and number digits) the extensio
                   of the types inside a composite type does not count)
   NAME_CLASH      an attribute or tabular section the extension adds (or an attribute it adds to an adopted tabular
                   section) has the name of one the vendor added in new
+  OBJECT_NAME_CLASH an object the extension owns (not adopted) has the name of a vendor object of the same kind in new
+                  (the same top-level folder of the dump, names case-insensitive): the platform does not apply the
+                  extension, «Уже существует объект с именем Обработка.ЗаменаСтавокНДС» (a real case,
+                  ЗаменаСтавок_Расш under УТ 11.5.27.79, the data processor is not in 11.5.17.172). Only the same kind
+                  is compared: the vendor configuration itself holds objects of different kinds under one name (УТ
+                  11.5.27.79: 47 common modules named as a data processor - ЖурналРегистрации; 5 catalogs named as a
+                  data processor - НастройкиЭДО), so different kinds share no namespace there; for an extension against
+                  the configuration that is not proven separately. A vendor object that is in old too (in_old) is not
+                  a clash the release brought: the extension did not apply before it either, or the base is not the
+                  configuration of old - the plan puts it under REVIEW
   NOT_IN_VENDOR   an adopted object or child is in neither old nor new: the base configuration is modified or the
                   field belongs to another extension - a question, not a breakage
   LIST_FIELD_LOST an adopted form whose dynamic list query the vendor changed (or made manual) no longer selects a
@@ -74,6 +84,8 @@ EXPLAIN = {
     "RENAMED": "вендор переименовал заимствованный реквизит или табличную часть (uuid тот же)",
     "TYPE_CHANGED": "вендор сменил тип old → new, в расширении старый",
     "NAME_CLASH": "собственный реквизит или табличная часть расширения совпали по имени с новым полем вендора",
+    "OBJECT_NAME_CLASH": "собственный объект расширения совпал по имени с объектом вендора того же вида в new — "
+                         "платформа расширение не применит",
     "NOT_IN_VENDOR": "заимствованного объекта или поля нет ни в old, ни в new: доработанная конфигурация или "
                      "чужое поле",
     "LIST_FIELD_LOST": "новый запрос динамического списка заимствованной формы не выбирает поле расширения",
@@ -588,15 +600,66 @@ def check_extra(ext, folder, name, cfg_old, cfg_new):
     return check_properties(ext, base, _kind_tag(paths[0]), *paths)
 
 
+def _folder_names(dump, folder, cache):
+    """{casefolded name: name} of the object XML files of one top-level folder of a dump, read once per dump."""
+    key = (dump.root, folder)
+    if key not in cache:
+        root = os.path.join(dump.root, folder)
+        cache[key] = {f[:-4].casefold(): f[:-4] for f in os.listdir(root) if f.lower().endswith(".xml")} \
+            if os.path.isdir(root) else {}
+    return cache[key]
+
+
+def check_own_names(ext, cfg_old, cfg_new, cache=None):
+    """OBJECT_NAME_CLASH of the objects the extension owns: a vendor object of the same kind (top-level folder) and
+    name in new. Ext (the configuration's own modules and command interface) is not a kind."""
+    cache = {} if cache is None else cache
+    found = []
+    for folder in sorted(os.listdir(ext.root)):
+        root = os.path.join(ext.root, folder)
+        if folder == "Ext" or not os.path.isdir(root):
+            continue
+        theirs = _folder_names(cfg_new, folder, cache)
+        if not theirs:
+            continue
+        before = _folder_names(cfg_old, folder, cache) if cfg_old is not None else {}
+        kind = metadata.FOLDER2KIND.get(folder.lower()) or EXTRA_KINDS.get(folder) or folder
+        for f in sorted(os.listdir(root)):
+            if not f.lower().endswith(".xml"):
+                continue
+            name = f[:-4]
+            vendor = theirs.get(name.casefold())
+            if vendor is None or metadata.adopted_file(os.path.join(root, f)):
+                continue
+            title = "%s.%s" % (kind, name)
+            in_old = name.casefold() in before
+            if in_old:
+                why = ("объект того же вида с тем же именем у вендора есть и в new, и в old (%s/%s.xml) — коллизия не "
+                       "от обновления: расширение не применялось и до него или конфигурация базы не совпадает с old "
+                       "(проверить в базе, применяется ли расширение)" % (folder, vendor))
+            else:
+                why = "в new у вендора появился объект того же вида с тем же именем (%s/%s.xml)" % (folder, vendor)
+            found.append({"ext": ext.name, "object": title, "file": "%s/%s.xml" % (folder, name), "part": "объект",
+                          "name": name, "check": "OBJECT_NAME_CLASH", "vendor_name": vendor, "in_old": in_old,
+                          "detail": "собственный объект расширения %s: %s; платформа не применит расширение: «Уже "
+                                    "существует объект с именем %s.%s» — переименовать объект расширения вместе со "
+                                    "ссылками на него (код, формы, Rights.xml ролей, ConfigDumpInfo.xml) или убрать его "
+                                    "из расширения, если вендор закрыл задачу своим объектом" % (title, why, kind,
+                                                                                                vendor)})
+    return found
+
+
 def analyze(ext_roots, cfg_old, cfg_new, only=None, skip=None, ported=None):
     """(extensions, findings, stats); ported - a list that gets {ext, list} of the lists already ported."""
     exts = metadata.find_extensions(ext_roots, only, skip)
     findings, stats = [], Counter()
     ported = [] if ported is None else ported
+    names = {}
     for ext in exts:
         compat = check_compat(ext, cfg_new)
         if compat is not None:
             findings.append(compat)
+        findings.extend(check_own_names(ext, cfg_old, cfg_new, names))
         for kind, (folder, _, _) in sorted(metadata.KINDS.items()):
             root = os.path.join(ext.root, folder)
             if not os.path.isdir(root):

@@ -25,6 +25,9 @@ function there, 11.5.27 deleted the module, and the call resolved to the extensi
 while the adoption had to go (borrowed OBJECT_REMOVED) and the call with it. Calls from the same object's own modules
 are not flagged for a removed object (they go with it), calls of a global module not for a renamed one (they name no
 module).
+STRUCT_KEY_NEW (struct_keys): the vendor method reads a key of a structure parameter in new it did not read in old, and
+the extension builds that structure itself without the key - a row of its own per argument (a real case: ОпцииПечати of
+ЗаполнитьРеквизитыШапкиУПД without ВерсияПостановления1137).
 """
 import argparse
 import os
@@ -32,7 +35,7 @@ import sys
 import time
 from collections import defaultdict, OrderedDict
 
-from . import bsl, fileio, metadata, refs
+from . import bsl, fileio, metadata, refs, struct_keys
 from .control_rebase import refuse_out_inside
 
 PLATFORM_MANAGER = {x.lower() for x in """
@@ -83,9 +86,11 @@ EXPLAIN = OrderedDict([
     ("SIGNATURE_CHANGED", "сигнатура old ≠ new, вызов по числу аргументов проходит"),
     ("CALLS_DEPRECATED", "вендор пометил метод устаревшим в этом релизе: работает, но вендор его больше не развивает "
                          "(устаревшие и в old — только счётом)"),
+    ("STRUCT_KEY_NEW", "метод вендора в new читает ключ параметра-структуры, которого не читал в old, а расширение "
+                       "строит эту структуру само и ключ не кладёт: «Поле объекта не обнаружено» (struct_keys)"),
 ])
 SEVERITY = {"OWNER_REMOVED": 0, "OWNER_RENAMED": 0, "REMOVED": 0, "MISSING": 1, "NOT_EXPORT": 1, "TOO_FEW_ARGS": 0,
-            "TOO_MANY_ARGS": 0, "SIGNATURE_CHANGED": 3, "CALLS_DEPRECATED": 2}
+            "TOO_MANY_ARGS": 0, "SIGNATURE_CHANGED": 3, "CALLS_DEPRECATED": 2, "STRUCT_KEY_NEW": 1}
 
 
 def kind_rel(kind, name, part):
@@ -403,6 +408,7 @@ def analyze(args):
     if not exts:
         sys.exit("no extension dumps found under --ext-root")
     rs = Resolver(cfg_new, cfg_old, exts)
+    vk = struct_keys.VendorKeys()
     index = refs.build(exts, refs.form_cache())
     findings = []
     stats = defaultdict(int)
@@ -510,6 +516,7 @@ def analyze(args):
                 note = ""
                 layer = "конфигурация"
                 sig_new = t_new
+                sig_risk = False
                 if t_new is None and any(cfg_new.find_method(r, name) is not None or rs.ext_defs(r, name) or (
                         cfg_old is not None and cfg_old.find_method(r, name) is not None) for r in alts):
                     stats["skipped_var_other_assignment"] += 1  # an #Если / Если branch may assign that module
@@ -559,6 +566,7 @@ def analyze(args):
                         if grade == "risk" and adopted and c["norm"] in rs.base_calls(rel_new):
                             grade, note = "info", "вызов дословно как в модуле new (перенесённая копия); " + note
                         flags.append("SIGNATURE_CHANGED")
+                        sig_risk = grade == "risk"
                         stats["sig_changed_" + grade] += 1
                         note = "[%s] %s" % ("риск" if grade == "risk" else "инфо", note)
                 deprecated = None
@@ -578,6 +586,19 @@ def analyze(args):
                     owned = owner_note(owner, layer != "конфигурация")
                     flags.insert(0, owned["flag"])
                     note = "; ".join(x for x in (owned.pop("note"), note) if x)
+                if t_new is not None and t_old is not None and caller is not None:
+                    # the call already reported for its arguments: a renamed parameter there is another structure
+                    reported = sig_risk or bool({"TOO_FEW_ARGS", "TOO_MANY_ARGS"} & set(flags))
+                    for sk in struct_keys.check(vk, mod, caller, c, cfg_new, trel_new, t_new, cfg_old, trel_old, t_old,
+                                                stats, reported):
+                        findings.append({
+                            "ext": ext.name, "module": rel, "module_title": metadata.module_title(rel),
+                            "line": c["line"], "caller": caller.name, "call": shown_call(chain, name), "args": nargs,
+                            "class": cls, "target": "%s.%s" % (metadata.module_title(trel), name), "layer": layer,
+                            "sig_new": t_new.signature(), "sig_old": t_old.signature(), "line_new": t_new.decl_line,
+                            "line_old": t_old.decl_line, "flags": ["STRUCT_KEY_NEW"], "note": sk.pop("note"),
+                            "copy": None, "advice": sk.pop("advice"), "caller_live": index.liveness(rel, caller),
+                            "src": mod.lines[c["line"] - 1].strip()[:200], "struct_key": sk})
                 if not flags:
                     continue
                 shown = shown_call(chain, name)
@@ -641,6 +662,10 @@ def render(cfg_new, cfg_old, exts, findings, stats, elapsed):
                   resolved, stats.get("platform_manager", 0), stats.get("platform_object", 0),
                   stats.get("unresolved_object_method", 0), stats.get("unresolved_manager_method", 0),
                   stats.get("skipped_shadowed", 0), stats.get("deprecated_in_old_too", 0)))
+    md.append("")
+    md.append("STRUCT_KEY_NEW не судится — структура пришла из параметра или функции: %d; у вызова уже есть находка по "
+              "аргументам, а параметр на этой позиции вендор переименовал: %d." % (
+                  stats.get("struct_key_unchecked", 0), stats.get("struct_key_reported", 0)))
     md.append("")
     main = [f for f in findings if f["flags"] != ["SIGNATURE_CHANGED"] or f["note"].startswith("[риск]")]
     info = [f for f in findings if f["flags"] == ["SIGNATURE_CHANGED"] and not f["note"].startswith("[риск]")]

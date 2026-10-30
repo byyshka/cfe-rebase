@@ -29,6 +29,7 @@ Flags (registry):
                       (a real case: СкладыСервер.ДобавитьВОчередьФормированияРасходныхОрдеров lost its call from posting): the
                       customization no longer runs on that path; callers_lost [{file, method, title, line_old,
                       instead - what that method calls in new and did not in old, method_in_new}], callers_new;
+                    replacement {method, callers, of, same_owner} - nearly every lost caller calls that one instead;
                       a caller that reaches the target in new through vendor methods within REACH_DEPTH calls is
                       not lost: callers_moved_deeper [{file, method, title, line_old, via}].
                       Both are counted by text over the vendor modules (vendor_callers) for every interception whose
@@ -780,6 +781,31 @@ def instead(fresh, target_owner, cfg_new, caller, limit=3):
     return sorted(keep, key=lambda v: 0 if target_owner and own in "." + v.casefold() else 1)[:limit]
 
 
+REPLACEMENT_MIN = 3     # lost callers still there in new, at least
+REPLACEMENT_SHARE = 0.8  # of them calling the same method instead
+
+
+def replacement(lost, target_owner):
+    """The method nearly every lost caller still there in new calls instead of the target, or None: the vendor
+    replaced the call systematically (a real case 11.5.17 -> 11.5.27: all 39 lost callers of
+    ОтветственныеЛицаСервер.ЗаполнитьМенеджера call УстановитьМенеджера of the same module). {method, callers, of,
+    same_owner} - same_owner: the method is in the target's own module, the customization most likely belongs there."""
+    alive = [c for c in lost if c.get("method_in_new") is not False]
+    if len(alive) < REPLACEMENT_MIN:
+        return None
+    count = defaultdict(int)
+    for c in alive:
+        for m in set(c.get("instead") or []):
+            count[m] += 1
+    if not count:
+        return None
+    method, k = max(count.items(), key=lambda x: (x[1], x[0]))
+    if k < REPLACEMENT_SHARE * len(alive):
+        return None
+    same = bool(target_owner) and method.casefold().startswith(target_owner.casefold() + ".")
+    return {"method": method, "callers": k, "of": len(alive), "same_owner": same}
+
+
 def _platform_invoked(ctx, r):
     """Why the platform itself runs the target in new whatever the BSL callers (an event handler), or None."""
     if r["source"] == "callType":
@@ -888,6 +914,12 @@ def mark_callers(ctx, rows):
                                   "перехват туда" % (o["calls"], where))
             else:
                 r["flags"].append("CALLERS_LOST")
+                swap = replacement(lost, owner if r["mkind"] in ("common", "manager") else None)
+                if swap:
+                    r["replacement"] = swap
+                    r["notes"].append("[риск] вендор заменил вызов: %d из %d потерянных мест в new вызывают %s — "
+                                      "перенести доработку на него (перехват %s)" % (
+                                          swap["callers"], swap["of"], swap["method"], swap["method"]))
                 r["notes"].append("[риск] код вендора в new перестал вызывать метод из: %s (вызовов old %d → new %d%s)"
                                   " — на этом пути доработка больше не выполняется: проверить, что вендор вызывает "
                                   "там вместо него%s" % (

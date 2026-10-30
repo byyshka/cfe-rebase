@@ -14,7 +14,7 @@
 раздел ниже. Из командной строки нейросеть не нужна вовсе. Как MCP-сервер пакет проверен только с Claude Code:
 протокол стандартный (stdio), но размер ответов и порядок работы в инструкции сервера подбирались под него.
 
-Версия 0.3.5: ядро, CLI, MCP-сервер, реестр баз, план адаптации, проверки заимствований, чтения регистров, имён
+Версия 0.3.6: ядро, CLI, MCP-сервер, реестр баз, план адаптации, проверки заимствований, чтения регистров, имён
 форм и рабочей копии, правка заимствований. Что доказано на переносах УТ и 218 расширениях ERP 2.5, а где есть оговорки — в `docs/VALIDATION.md`.
 
 Требования: Python 3.12+, `git` в `PATH` (трёхстороннее слияние — `git merge-file`). Сторонних зависимостей у ядра
@@ -130,7 +130,7 @@ Windows: пути синтетического корпуса доходят д�
 | Команда | Что делает |
 |---|---|
 | `interceptors` | реестр перехватов расширений против нового релиза и мёртвый код расширений; перехват метода, который вендор пометил устаревшим (`TARGET_DEPRECATED`), и такого, который код вендора в new больше не вызывает нигде (`TARGET_UNCALLED`) или на части путей (`CALLERS_LOST`) |
-| `calls` | вызовы методов конфигурации из расширений: наличие метода и число параметров в новом релизе, вызов метода, устаревшего в этом релизе (`CALLS_DEPRECATED`), вызов в модуль заимствованного объекта, который вендор удалил или переименовал, — и собственного метода расширения там (`OWNER_REMOVED` / `OWNER_RENAMED`); у вызова внутри копии `&Вместо` / `&ИзменениеИКонтроль` — уйдёт ли он пересъёмкой копии и как его теперь вызывает вендор |
+| `calls` | вызовы методов конфигурации из расширений: наличие метода и число параметров в новом релизе, вызов метода, устаревшего в этом релизе (`CALLS_DEPRECATED`), ключ параметра-структуры, который вендор начал читать, а расширение в свою структуру не кладёт (`STRUCT_KEY_NEW`), вызов в модуль заимствованного объекта, который вендор удалил или переименовал, — и собственного метода расширения там (`OWNER_REMOVED` / `OWNER_RENAMED`); у вызова внутри копии `&Вместо` / `&ИзменениеИКонтроль` — уйдёт ли он пересъёмкой копии и как его теперь вызывает вендор |
 | `bodies` | замороженные копии `&Вместо` против тела метода в старом и новом релизе: изменения вендора old→new, которые уже в копии (`in_copy`), и основа копии по ним (`new`, `mixed`, `old`, `older`); копия и обработчик события заимствованной формы, назначенный в `Form.xml` с `callType="Override"` без `ПродолжитьВызов` (`binding: callType`, вид «Вместо (callType)», цель — обработчик события в форме вендора) |
 | `queries` | тексты запросов, схемы СКД и имена метаданных в строках против нового релиза |
 | `merge-copy` | перенос одной копии `&Вместо` на тело нового релиза трёхсторонним слиянием; конфликты из одних пробелов разрешаются, вставки в одной точке помечаются; блок автора под другими условиями (`AUTHOR_BLOCK_MOVED`), вынесенное вендором тело (`BODY_EXTRACTED`); обёртку с `ПродолжитьВызов` не сливает |
@@ -224,6 +224,25 @@ uuid объекта расширения: `borrowed` выдаёт `OBJECT_RENAME
 есть в `BaseForm`, а в 11.5.17 и 11.5.27 его нет (было и до переноса). С переставленными релизами (11.5.27 →
 11.5.17) находит оба реквизита формы, которые 11.5.27 добавил и которыми пользуется рабочая копия.
 
+### `template-params`
+
+    cfe-rebase template-params --ext-root <выгрузки расширений> --config-old <old> --config-new <new> --out <папка>
+
+Параметры табличных макетов вендора, которые новый релиз убрал или переименовал. Имени, которого в области нет,
+платформа не замечает: ячейка печатается пустой, ошибки нет (реальный случай, подтверждено печатью: пользовательский
+макет расходного ордера с 11.5.17 хранит `ПредставлениеЕдининицыИзмеренияУпаковки`, 11.5.27 пишет
+`ПредставлениеЕдиницыИзмеренияУпаковки`). Старые имена держат пользовательские макеты базы
+(`РегистрСведений.ПользовательскиеМакетыПечати`), макеты расширений и код расширений. Имена — `<parameter>`,
+`<detailParameter>`, `[Имя]` ячеек с заполнением «Шаблон»; пара переименования — расстояние правки ≤ 2, ячеек поровну,
+кандидат единственный.
+РИСК — `CODE_OLD_NAME` (код пишет старое имя), `TEMPLATE_OLD_NAME` (заимствованный макет с `Template` = `Extended` — в
+режиме «Объединять» только ячейка, изменённая расширением: нетронутая берёт новое значение вендора, проверено печатью;
+копия, из которой код берёт по имени область с этой ячейкой), `VENDOR_RENAMED` (печатный макет «ПФ_» с
+переименованием). ПРОВЕРИТЬ — `COPY_OLD_NAME` (копия со старым именем вне областей, которые код из неё берёт),
+`VENDOR_GONE`. В отчёте — запрос для тулкита по печатным макетам из находок: `Объект`, `ИмяМакета`, `Использование`.
+Строка с `Использование` = Истина — макет переопределён и действует: переименовать параметр в его ячейках или сбросить
+на поставляемый. В `prepare` не входит; запускать по выгрузке «до» и по рабочей копии. MCP — `check_template_params`.
+
 ### `borrow-edit`
 
 ```
@@ -291,6 +310,7 @@ cfe-rebase prepare --db demo-ut-27 --to 11.5.27.79 --no-dump  # эталон: pr
 | `databases[].extensions` | имена расширений для `{names}`: строка или объект с полем `name` (прочие поля объекта не читаются) |
 | `databases[].cfe_rebase.from` | релиз, под который написаны расширения базы; `--from` перекрывает |
 | `databases[].cfe_rebase.proof_corpus` | `true` — `ext_dump` базы эталонный: `prepare` с выгрузкой отказывает (только `--no-dump`) |
+| `databases[].cfe_rebase.ext_all` | выгрузка ВСЕХ расширений базы (от `task_dir` или абсолютная; `prepare` её не выгружает): проход вне периметра |
 | `task_dir` | папка задачи; `ext_dump` (по умолчанию `old\xml`), `work` (`work`), `reports` (`reports`) — от неё, абсолютные тоже допустимы |
 
 Пути — с `\` или `/`, с `~`; относительные `releases` и `task_dir` — от папки реестра.
@@ -327,6 +347,13 @@ cfe-rebase prepare --db <id> --to <релиз> [--from <релиз>] [--registry
 4. `control_rebase` (с `--work`, если рабочая копия была до этого вызова: свежую копию `ext` сверять не с чем),
    `interceptors`, `calls`, `queries`, `bodies`, `borrowed`, `registers`, `names` — в `<reports>/prepare-<run_id[:8]>/<инструмент>/`;
    `--only` — одно расширение.
+   С `ext_all` — расширения базы вне периметра (есть в `ext_all`, нет в `ext`; своё — по имени или uuid
+   `Configuration`) проходят `borrowed` и `control_rebase` в `<reports>/prepare-<id8>/out_of_perimeter/`. В plan.md —
+   раздел «Вне периметра — не применятся» (ошибка заимствования: платформа откажет), «Только &ИзменениеИКонтроль»
+   (не доказано, что не применится) и список чистых; пунктами плана эти расширения не становятся. `FOREIGN_OBJECT` —
+   код периметра обращается к объекту, который есть только у расширения вне периметра: «исправить», если то не
+   применится, иначе «уточнить». Не покрыто: предопределённые, сигнатуры перехватов этих расширений, реквизиты
+   чужих расширений на объектах вендора.
 5. План адаптации (`plan.json`, `plan.md` рядом): находки восьми отчётов (из `names` — только
    `LIST_QUERY_FIELD_MISSING` и `LIST_FIELD_NOT_LOADED`) сведены в пункты «расширение + модуль +
    метод» (для заимствований — объект) и разложены на **исправить** (что сломало или изменило обновление: перенос
@@ -415,11 +442,11 @@ claude mcp add -s user cfe-rebase -- cfe-rebase mcp
 | `check_copies` | `bodies` | копии `&Вместо` без `ПродолжитьВызов` против тела вендора — и обработчики событий заимствованных форм, назначенные в `Form.xml` с `callType="Override"` без `ПродолжитьВызов` (`kind` «Вместо (callType)», `owner` / `event` / `form` / `xml_line`; собственные элементы и команды расширения, `Before` / `After` и события без обработчика вендора — не копии; `summary.calltype`): `result` `pass` — основа копии `new` / `same-new` или каждое изменение вендора old→new уже в копии (`vendor_in_copy` = `vendor_hunks`, в том числе 0), иначе `fail`; `basis` (`new`, `mixed` — часть изменений вендора в копии, часть нет, `old`, `older`, `same-old`, `same-new`); у `fail` — модуль и `copy_lines`, тело вендора old / new, `missing` — изменения вендора, которых в копии нет (класс и диапазоны строк), `note` — базового метода нет. Для рабочей копии перед загрузкой |
 | `check_calls` | `calls` | только находки с флагами (`OWNER_REMOVED` — модуль вызова у заимствованного объекта, который вендор в new удалил: вызов не скомпилируется после снятия заимствования, даже если метод собственный, расширения; `OWNER_RENAMED` — объект вендор переименовал, вызывать через новое имя; у обоих `owner`; `REMOVED`, `MISSING`, `NOT_EXPORT`, `TOO_FEW_ARGS`, `TOO_MANY_ARGS`, `SIGNATURE_CHANGED` с `grade` risk/info — только переименованные параметры при прежних числе, порядке, `Знач` и умолчаниях — info, `CALLS_DEPRECATED` — метод устарел в этом релизе, `deprecated` (`vendor_calls_new` — сколько раз его вызывает сам вендор в new; если вызывает — `grade` info); устаревшие и в old — только счётом в отчёте); у вызова в копии `&Вместо` / `&ИзменениеИКонтроль` — `copy` (есть ли он в теле вендора old / new, куда вендор его перенёс) и `advice`; в `summary` — `in_copies` и `fixed_by_report` (уйдут пересъёмкой копии) |
 | `check_queries` | `queries` | только находки (query / dcs / literal, что не разрешилось, состояние в old; у literal в методе `where` — «метод X»); строка `ПредопределенноеЗначение("…")` в текст запроса метода не входит; «не судится» — числом и путём к отчёту |
-| `check_borrowed` | `borrowed` | заимствования против new: `OBJECT_REMOVED`, `OBJECT_RENAMED` (вендор переименовал объект, uuid тот же; в `detail` — вызов `borrow-edit --rename`), `REMOVED` (с подсказкой «Удалить<Имя>»), `RENAMED` (реквизит, измерение, ресурс, значение, табличная часть переименованы вендором), `TYPE_CHANGED`, `PROPERTY_CHANGED` (контролируемое свойство заимствованного объекта, его формы, макета или команды хранит значение old, вендор сменил его в new — платформа откажет «Значение контролируемого свойства … не совпадает»; `value` / `new_value`, подсказка `cfe-borrow`, если новое значение ссылается на объект, которого в расширении нет; синоним, представления, основные формы и схема, движения, состав и значения расширения, отличные от old, не сверяются), `COMPAT_MODE` (`CompatibilityMode` в `Configuration.xml` расширения не тот, что у new — отказ загрузки; `ext_value` / `new_value`; `ConfigurationExtensionCompatibilityMode` не сравнивается), `NAME_CLASH`, `NOT_IN_VENDOR` (вопрос, не ошибка), `LIST_FIELD_LOST` / `LIST_CHANGED` (динамический список заимствованной формы; «вендор изменил» — текст запроса, `ManualQuery` или `MainTable`; список, где правка вендора уже в запросе расширения или `BaseForm` — уже список new, не находка: `summary.lists_ported`, перечень — `lists_ported` отчёта), `XML_UNREADABLE` (XML не разобран — других вердиктов нет); заимствованная форма без `ExtendedConfigurationObject` находкой не считается (проверено на базе: применяется); формы расширения, где поле привязано; имена — без учёта регистра |
+| `check_borrowed` | `borrowed` | заимствования против new: `OBJECT_REMOVED`, `OBJECT_RENAMED` (вендор переименовал объект, uuid тот же; в `detail` — вызов `borrow-edit --rename`), `OBJECT_NAME_CLASH` (собственный объект расширения под именем объекта вендора того же вида в new — «Уже существует объект с именем …»; `vendor_name`, `in_old` — был и в old), `REMOVED` (с подсказкой «Удалить<Имя>»), `RENAMED` (реквизит, измерение, ресурс, значение, табличная часть переименованы вендором), `TYPE_CHANGED`, `PROPERTY_CHANGED` (контролируемое свойство заимствованного объекта, его формы, макета или команды хранит значение old, вендор сменил его в new — платформа откажет «Значение контролируемого свойства … не совпадает»; `value` / `new_value`, подсказка `cfe-borrow`, если новое значение ссылается на объект, которого в расширении нет; синоним, представления, основные формы и схема, движения, состав и значения расширения, отличные от old, не сверяются), `COMPAT_MODE` (`CompatibilityMode` в `Configuration.xml` расширения не тот, что у new — отказ загрузки; `ext_value` / `new_value`; `ConfigurationExtensionCompatibilityMode` не сравнивается), `NAME_CLASH`, `NOT_IN_VENDOR` (вопрос, не ошибка), `LIST_FIELD_LOST` / `LIST_CHANGED` (динамический список заимствованной формы; «вендор изменил» — текст запроса, `ManualQuery` или `MainTable`; список, где правка вендора уже в запросе расширения или `BaseForm` — уже список new, не находка: `summary.lists_ported`, перечень — `lists_ported` отчёта), `XML_UNREADABLE` (XML не разобран — других вердиктов нет); заимствованная форма без `ExtendedConfigurationObject` находкой не считается (проверено на базе: применяется); формы расширения, где поле привязано; имена — без учёта регистра |
 | `check_registers` | `registers` | методы, которые пишут в регистр с изменившимися измерениями: `check` (`CHANGED`, `REGISTER_REMOVED` — регистра в new нет, `XML_UNREADABLE`), `missing` (новые измерения, имени которых нет в тексте метода), `stale` (удалённые поля), `to_res` / `key_lost` (измерения, ставшие ресурсом или реквизитом, и те из них, что метод использует), `callers` (кто вызывает метод) |
 | `check_names` | `names` | имена формы вендора, которые читает код заимствованных форм (раздел `names` выше): `how`, `name`, `check` (`GONE_IN_NEW`, `NOT_IN_VENDOR`, `XML_UNREADABLE`, `LIST_QUERY_FIELD_MISSING`, `LIST_FIELD_NOT_LOADED`), `level`, `lines`, `methods`, `path` — модуль формы (у списка из `Form.xml` — `Form.xml`), у списков `needed_by`, `new_in_new`; `summary` — проверки, уровни, форм, имён, `list_queries` / `list_queries_unjudged` |
 | `check_reads` | `reads` | регистры, которые расширения читают в запросах, с изменившимся в new составом или регистраторами — справочно, `sev` = `ПРОВЕРИТЬ`, вердиктов нет: `check` (`CHANGED`, `REGISTER_REMOVED`, `XML_UNREADABLE`), `dims_added` / `dims_removed`, `res_added` / `res_removed`, `attrs_added` / `attrs_removed` (переименованный вендором в «Удалить<Имя>» — удалённый, новое имя в `detail`), `type_changed` (`part`, `name`, `old`, `new`; `defined_type` — сменился определяемый тип поля; и у поля, перешедшего в другую часть), `props_changed` (`name`, `old`, `new`: `RegisterType`, `InformationRegisterPeriodicity`, `WriteMode`, `<Измерение>.UseInTotals`), `recorders_added` / `recorders_removed` (документы, у которых регистр в `RegisterRecords`), `reads` (каждое место чтения: `path`, `line`, `where`, `table` — как написана, с виртуальной таблицей, `fields` — поля через её псевдоним); временные таблицы, параметры, собственные регистры расширений и регистры, которых нет в old, не берутся, регистры без изменений — только в `summary` (`registers_unchanged`) |
-| `check_work` | `lint` | рабочая копия перед загрузкой: маркеры слияния, структура модулей, неизвестная инструкция препроцессора, `ENCODING` (не UTF-8), с `ext` — потерянные файлы, BOM и концы строк модулей (`EOL_LF`, `EOL_MIXED`); `OBJECT_REMOVED`, `CHILD_REMOVED` (форма, макет или команда убраны вместе с записью у владельца), `OBJECT_RENAMED` (объект переименован в рабочей копии, файлы сверены под новым путём) — к подтверждению; `EXT_NAME_STALE` (error: `Roles/*/Ext/Rights.xml` даёт права на `Configuration.<имя>`, а имя не то, что в `Configuration.xml` расширения — после `cf-edit modify-property Name`; платформа: «Неизвестный объект метаданных - Configuration.<старое имя>» на каждую роль), `EXT_NAME_STALE_DUMP_INFO` (info: то же старое имя в `ConfigDumpInfo.xml` — полную загрузку не ломает); `old_name` / `new_name`; несуществующий `ext` — отказ; `out` — вне `work` и `ext` |
+| `check_work` | `lint` | рабочая копия перед загрузкой: `ROLE_NO_RIGHTS` (risk: собственная роль без `Ext/Rights.xml` при собственных объектах с правами — после загрузки из XML роль пустая; при флаге «для новых объектов» создать Rights.xml с `setForNewObjects=true` без `<object>`; по выгрузке не отличить от пустой роли — сверить права в базе-источнике); маркеры слияния, структура модулей, неизвестная инструкция препроцессора, `ENCODING` (не UTF-8), с `ext` — потерянные файлы, BOM и концы строк модулей (`EOL_LF`, `EOL_MIXED`); `OBJECT_REMOVED`, `CHILD_REMOVED` (форма, макет или команда убраны вместе с записью у владельца), `OBJECT_RENAMED` (объект переименован в рабочей копии, файлы сверены под новым путём) — к подтверждению; `EXT_NAME_STALE` (error: `Roles/*/Ext/Rights.xml` даёт права на `Configuration.<имя>`, а имя не то, что в `Configuration.xml` расширения — после `cf-edit modify-property Name`; платформа: «Неизвестный объект метаданных - Configuration.<старое имя>» на каждую роль), `EXT_NAME_STALE_DUMP_INFO` (info: то же старое имя в `ConfigDumpInfo.xml` — полную загрузку не ломает); `old_name` / `new_name`; несуществующий `ext` — отказ; `out` — вне `work` и `ext` |
 | `applied_text` | `applied` | список файлов применённой копии и число опустошённых строк в каждом; `dst` — вне любой выгрузки |
 | `apply_candidate` | — | единственный, кто правит модули: заменяет строки модуля в рабочей копии (только git-репозиторий) файлом-кандидата, BOM и концы строк модуля сохраняются; отказывает, если модуль или кандидат не в UTF-8, в кандидате маркеры конфликта или замена ломает структуру модуля (диапазон не тот); ответ — новый диапазон и `git diff --numstat` |
 | `apply_borrow_edit` | `borrow-edit` | снять или переименовать заимствования в рабочей копии; по умолчанию `dry_run=True` — только план (`items`: ссылки `action=ref`, затем файлы `delete` / `move` / `change`), с `dry_run=False` — применить; отказ при применении — `bad_input` с причинами и первыми ссылками; `db` / `to` — `work`, `out` и `config_new` из реестра |
@@ -448,14 +475,14 @@ claude mcp add -s user cfe-rebase -- cfe-rebase mcp
 
 | Инструмент | `error` | `risk` | `info` | Ключ |
 |---|---|---|---|---|
-| `check_calls` | `OWNER_REMOVED`, `OWNER_RENAMED`, `REMOVED`, `MISSING`, `NOT_EXPORT`, `TOO_FEW_ARGS`, `TOO_MANY_ARGS` | `SIGNATURE_CHANGED` risk, `CALLS_DEPRECATED` risk | `SIGNATURE_CHANGED` info, `CALLS_DEPRECATED` info (вендор сам вызывает метод в new) | `ext\|module\|caller\|call\|flags` |
+| `check_calls` | `OWNER_REMOVED`, `OWNER_RENAMED`, `REMOVED`, `MISSING`, `NOT_EXPORT`, `TOO_FEW_ARGS`, `TOO_MANY_ARGS`, `STRUCT_KEY_NEW` error | `SIGNATURE_CHANGED` risk, `CALLS_DEPRECATED` risk, `STRUCT_KEY_NEW` risk | `SIGNATURE_CHANGED` info, `CALLS_DEPRECATED` info (вендор сам вызывает метод в new) | `ext\|module\|caller\|call\|flags` |
 | `check_queries` | `ОШИБКА?` | `РИСК` | `ПРОВЕРИТЬ` (внутри уровня первыми — «было корректно») | `ext\|file\|where\|part\|kind\|ref` |
-| `check_borrowed` | `COMPAT_MODE`, `OBJECT_REMOVED`, `OBJECT_RENAMED`, `REMOVED`, `RENAMED`, `TYPE_CHANGED`, `PROPERTY_CHANGED`, `LIST_FIELD_LOST`, `NAME_CLASH` | `XML_UNREADABLE`, `LIST_CHANGED` | `NOT_IN_VENDOR` | `ext\|object\|part\|name\|check` |
+| `check_borrowed` | `COMPAT_MODE`, `OBJECT_REMOVED`, `OBJECT_RENAMED`, `OBJECT_NAME_CLASH`, `REMOVED`, `RENAMED`, `TYPE_CHANGED`, `PROPERTY_CHANGED`, `LIST_FIELD_LOST`, `NAME_CLASH` | `XML_UNREADABLE`, `LIST_CHANGED` | `NOT_IN_VENDOR` | `ext\|object\|part\|name\|check` |
 | `check_registers` | `REGISTER_REMOVED`, непустые `stale` или `key_lost` | остальное | — | `ext\|module\|method\|register\|check` |
 | `check_reads` | `REGISTER_REMOVED` | `XML_UNREADABLE`; `CHANGED` с изменёнными измерениями, убранными ресурсами или реквизитами, сменившимися свойствами | остальное `CHANGED` | `ext\|register\|check` |
 | `list_interceptors` | `MISSING_BASE`, `TARGET_RENAMED`, `TARGET_UNCALLED`, `SIGNATURE_MISMATCH`, `SIGNATURE_CHANGED`, `CONTROL_MISMATCH` | `CALLERS_LOST`, `CONFLICT`, `OVERRIDDEN`, `OVERRIDDEN?`, `BINDING_CHANGED`, `NEW_BASE`, `TARGET_DEPRECATED` (устарел только в new и вендор в new его не вызывает) | остальное и строки без флагов | `ext\|module\|kind\|target\|ext_method\|flags` |
 | `check_names` | `GONE_IN_NEW`, `LIST_QUERY_FIELD_MISSING` (поле новое в new), `FIELD_NOT_ADOPTED` (поле новое в new) | `GONE_IN_NEW`, который модуль формы new всё ещё называет; `FIELD_NOT_ADOPTED` (поле было и в old); `NOT_IN_VENDOR` из `BaseForm`; `XML_UNREADABLE`; `LIST_QUERY_FIELD_MISSING` (поле требовала и форма old); `LIST_FIELD_NOT_LOADED` | `NOT_IN_VENDOR` | `ext\|module\|how\|name\|check` |
-| `check_work` | `severity` = error | — | `severity` = info | `ext\|file\|check` |
+| `check_work` | `severity` = error | `ROLE_NO_RIGHTS` | `severity` = info | `ext\|file\|check` |
 
 Расширение, переименованное между прогонами (рабочая копия — `<имя>_<релиз>_<дата>_v_…`), считается тем же: по uuid
 `Configuration`, когда обе стороны — выгрузки; иначе — если без пары с каждой стороны ровно по одному имени или текущее
@@ -506,7 +533,7 @@ flagged, `registers` the writes to registers whose dimensions changed, `reads` (
 the registers extension queries read whose composition or recorders changed, and `lint` a ported work copy before it is
 loaded; `borrow-edit` removes an adoption or renames it to the vendor's new name (vendor renames keep the uuid, and
 every check matches adopted objects by it). Python 3.12+, `git` on `PATH`, no third-party dependencies in the core, no
-1C platform needed. Version 0.3.5,
+1C platform needed. Version 0.3.6,
 tested on four extension migrations of real 1C:Trade Management bases 11.5.22.159 → 11.5.27.79;
 neither vendor configuration code nor customer extensions are part of the repository — the tests run on a synthetic
 corpus. Documentation is in Russian. License: AGPL-3.0 (© 2026 byyshka); closed-source use requires a separate

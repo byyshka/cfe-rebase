@@ -30,6 +30,8 @@ COMMANDS = {
     "reads": ("reads", "чтение регистров в запросах, у которых новый релиз изменил состав или регистраторов"),
     "names": ("names", "имена формы вендора (элементы, реквизиты, параметры, поля объекта), которые читает код "
                        "заимствованных форм, против old и new; поля, которых нет в подменённом запросе списка"),
+    "template-params": ("template_params", "параметры табличных макетов, которые новый релиз убрал или переименовал: "
+                                           "код и макеты расширений со старым именем, пользовательские макеты базы"),
     "prepare": ("prepare", "подготовка к адаптации базы из реестра: выгрузка, рабочая копия под git, восемь отчётов "
                            "и план"),
     "select": ("selection", "выборка из готового отчёта проверки: модуль, объект, флаг, уровень, «до/после», принятые"),
@@ -40,7 +42,7 @@ COMMANDS = {
 _DUMPS = {"ext": "--ext-root", "old": "--config-old", "new": "--config-new", "out": "--out"}
 DB_FLAGS = {
     "interceptors": _DUMPS, "calls": _DUMPS, "bodies": _DUMPS, "queries": _DUMPS, "borrowed": _DUMPS, "registers": _DUMPS,
-    "reads": _DUMPS, "names": _DUMPS,
+    "reads": _DUMPS, "names": _DUMPS, "template-params": _DUMPS,
     "control-rebase": {"ext": "--ext", "old": "--old", "new": "--new", "out": "--out", "work": "--work"},
     "method-diff": {"ext": "--ext", "old": "--old", "new": "--new", "out": "--out"},
     "lint": {"work": "--work", "ext": "--ext", "out": "--out"},
@@ -56,6 +58,7 @@ OPTIONS = {
     "registers": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "reads": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "names": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
+    "template-params": ("--ext-root", "--ext", "--skip", "--config-old", "--config-new", "--out"),
     "control-rebase": ("--ext", "--old", "--new", "--out", "--work", "--only"),
     "method-diff": ("--ext", "--old", "--new", "--out", "--only", "--method"),
     "lint": ("--work", "--ext", "--only", "--out"),

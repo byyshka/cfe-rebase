@@ -96,6 +96,19 @@ class Resolve(unittest.TestCase):
                     "from": fx.FROM, "task_dir": self.task, "ext_dump": "before\\xml", "proof_corpus": value})
                 self.assertIs(registry.resolve(reg, fx.DB, fx.TO)["proof_corpus"], want)
 
+    def test_ext_all(self):
+        self.assertIsNone(registry.resolve(self.reg, fx.DB, fx.TO)["ext_all"])
+        reg, task = fx.make(os.path.join(self.tmp, "all"), db_cfg={"from": fx.FROM, "task_dir": "задача",
+                                                                    "ext_all": "все\\xml"})
+        self.assertEqual(registry.resolve(reg, fx.DB, fx.TO)["ext_all"],
+                         os.path.join(self.tmp, "all", "задача", "все", "xml"))
+        reg, _ = fx.make(os.path.join(self.tmp, "abs"), db_cfg={"from": fx.FROM, "ext_dump": fx.EXT, "work": fx.WORK,
+                                                                 "reports": self.tmp, "ext_all": fx.EXT})
+        self.assertEqual(registry.resolve(reg, fx.DB, fx.TO)["ext_all"], fx.EXT)
+        reg, _ = fx.make(os.path.join(self.tmp, "rel"), db_cfg={"from": fx.FROM, "ext_dump": fx.EXT, "work": fx.WORK,
+                                                                 "reports": self.tmp, "ext_all": "все"})
+        self.assertIn("cfe_rebase.ext_all", self.error(reg, fx.DB, fx.TO))
+
     def test_old_release_only_when_needed(self):
         # lint and the tools given old explicitly need no release: no cfe_rebase.from, an empty releases list
         reg, _ = fx.make(os.path.join(self.tmp, "b"), releases={}, db_cfg={"task_dir": self.task})

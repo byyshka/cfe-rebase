@@ -280,6 +280,87 @@ class Prepare(unittest.TestCase):
         self.assertEqual(prepare._copy_error(OSError(28, "No space left on device")),
                          "[Errno 28] No space left on device")
 
+    def test_out_of_perimeter(self):
+        base = os.path.join(self.tmp, "all")
+        task = os.path.join(base, fx.TASK)
+        ext, ext_all = fx.make_ext_all(task)
+        reg, _ = fx.make(base, db_cfg={"from": fx.FROM, "task_dir": task, "ext_dump": "before\\xml",
+                                       "ext_all": "all\\xml"})
+        res = prepare.run(fx.DB, fx.TO, registry_path=reg, dump=False)
+        o = res["out_of_perimeter"]
+        self.assertEqual(o["ext_all"], ext_all)
+        self.assertEqual(o["perimeter"], [fx.EXT_ALL_V2])  # renamed in the base: matched by the uuid of Configuration
+        self.assertEqual(sorted(o["extensions"]), sorted([fx.EXT_MAIN, fx.EXT_FOREIGN, fx.EXT_CLEAN]))
+        self.assertEqual([x["ext"] for x in o["not_applied"]], [fx.EXT_FOREIGN])
+        self.assertTrue(o["not_applied"][0]["first"].startswith("COMPAT_MODE"), o["not_applied"][0])
+        self.assertEqual([x["ext"] for x in o["control_only"]], [fx.EXT_MAIN])
+        self.assertEqual(o["control_only"][0]["borrowed"], 0)
+        self.assertGreaterEqual(o["control_only"][0]["control"], 10)  # 9 REBASED and 1 CONFLICTS at least
+        self.assertIn("&ИзменениеИКонтроль", o["control_only"][0]["first"])
+        self.assertEqual(o["clean"], [fx.EXT_CLEAN])
+        # the perimeter extension of ext_all is not checked again
+        with open(o["reports"]["borrowed"]["json"], encoding="utf-8") as fh:
+            self.assertEqual({f["ext"] for f in json.load(fh)["findings"]}, {fx.EXT_FOREIGN})
+        with open(o["reports"]["control_rebase"]["json"], encoding="utf-8") as fh:
+            self.assertEqual({m["ext"] for m in json.load(fh)["methods"]}, {fx.EXT_MAIN})
+        self.assertEqual(os.path.dirname(os.path.dirname(o["reports"]["borrowed"]["json"])),
+                         os.path.join(os.path.dirname(res["prepare_json"]), "out_of_perimeter"))
+        # FOREIGN_OBJECT: the perimeter reads a constant of an extension that will not be applied (error) and queries
+        # a catalog of a clean one (info); a comment, a vendor object and a name nobody has are not findings
+        got = {(f["object"], f["owner"], f["level"], tuple(f["how"])) for f in o["foreign"]}
+        self.assertEqual(got, {("Константа.Синт_Дата", fx.EXT_FOREIGN, "error", ("code",)),
+                               ("Справочник.Синт_Склады2", fx.EXT_CLEAN, "info", ("query",))})
+        by = {f["object"]: f for f in o["foreign"]}
+        self.assertEqual(by["Константа.Синт_Дата"]["method"], "Синт_ДатаНачала")
+        self.assertEqual(len(by["Константа.Синт_Дата"]["lines"]), 1)  # the comment line is not code
+        self.assertEqual(by["Константа.Синт_Дата"]["module"], "CommonModules/ЗаказыСервер/Ext/Module.bsl")
+        with open(res["plan"]["json"], encoding="utf-8") as fh:
+            plan = json.load(fh)
+        foreign = [x for x in plan["items"] if "out_of_perimeter:FOREIGN_OBJECT" in x["sources"]]
+        # the query of the clean one is a REVIEW item of queries too («не разрешалось и в old»): FOREIGN_OBJECT names
+        # whose object it is in the same item
+        self.assertEqual(sorted(x["group"] for x in foreign), ["MUST_FIX", "REVIEW"])
+        review = next(x for x in foreign if x["group"] == "REVIEW")
+        self.assertIn("queries:query", review["sources"])
+        self.assertTrue(any(fx.EXT_CLEAN in w for w in review["what"]))
+        must = next(x for x in foreign if x["group"] == "MUST_FIX")
+        self.assertIn(fx.EXT_FOREIGN, must["what"][0])
+        self.assertIn("не применится", must["what"][0])
+        self.assertIn("Синт_Дата", " ".join(x["what"][0] for x in res["plan"]["must_fix"]))
+        # the outside extensions themselves are never plan items
+        self.assertFalse({x["ext"] for x in plan["items"]} & {fx.EXT_MAIN, fx.EXT_FOREIGN, fx.EXT_CLEAN})
+        self.assertEqual(plan["out_of_perimeter"]["foreign"], {"error": 1, "risk": 0, "info": 1})
+        with open(res["plan"]["md"], encoding="utf-8") as fh:
+            md = fh.read()
+        for text in ("## Вне периметра — не применятся — 1", "### Только &ИзменениеИКонтроль не проходит контроль — 1",
+                     "Без ошибок заимствований и контроля: " + fx.EXT_CLEAN, "FOREIGN_OBJECT"):
+            self.assertIn(text, md)
+        self.assertLess(md.index("## Исправить"), md.index("## Вне периметра"))
+        screen = prepare.screen(res)
+        self.assertIn("вне периметра (%s): не применятся 1, только &ИзменениеИКонтроль 1, без ошибок 1" % ext_all,
+                      screen)
+        self.assertIn("FOREIGN_OBJECT): error 1, risk 0, info 1", screen)
+        # without ext_all - no pass, no section in the plan
+        shutil.copytree(fx.EXT, self.ext)
+        plain = prepare.run(fx.DB, fx.TO, registry_path=self.reg, dump=False)
+        self.assertIsNone(plain["out_of_perimeter"])
+        with open(plain["plan"]["json"], encoding="utf-8") as fh:
+            self.assertNotIn("out_of_perimeter", json.load(fh))
+        self.assertNotIn("вне периметра", prepare.screen(plain))
+
+    def test_ext_all_without_extensions_is_refused(self):
+        base = os.path.join(self.tmp, "empty")
+        task = os.path.join(base, fx.TASK)
+        os.makedirs(os.path.join(task, "all"))
+        shutil.copytree(fx.EXT, os.path.join(task, "before", "xml"))
+        reg, _ = fx.make(base, db_cfg={"from": fx.FROM, "task_dir": task, "ext_dump": "before\\xml",
+                                       "ext_all": "all"})
+        with self.assertRaises(prepare.PrepareError) as cm:
+            prepare.run(fx.DB, fx.TO, registry_path=reg, dump=False)
+        self.assertEqual(cm.exception.code, prepare.BAD_INPUT)
+        self.assertIn("cfe_rebase.ext_all", cm.exception.message)
+        self.assertFalse(os.path.exists(os.path.join(task, "work")))  # refused before the work copy
+
     def test_run_returns_the_data(self):
         with self.assertRaises(prepare.PrepareError) as cm:
             prepare.run(fx.DB, None, registry_path=self.reg)

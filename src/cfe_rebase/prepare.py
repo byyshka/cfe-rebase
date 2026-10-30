@@ -12,6 +12,14 @@ names into <reports>/prepare-<run_id[:8]>/<tool>/; merge their findings into an 
 plan.md; of names only LIST_QUERY_FIELD_MISSING, LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED);
 print one screen and write the same data to prepare.json next to them.
 
+Out of the perimeter: with cfe_rebase.ext_all (a dump of all extensions of the database) the extensions there that are
+not in ext (matched by name or by the uuid of Configuration, which survives a rename) get borrowed and control_rebase
+into <reports>/prepare-<run_id[:8]>/out_of_perimeter/<tool>/; the plan gets a separate section of them (not items):
+not_applied - an adopted object or field the platform will refuse (a borrowed error), control_only - only an
+&ИзменениеИКонтроль that does not pass the control on new, clean - neither. ext_all is never dumped. The perimeter's
+code that reaches for an object only an outside extension adds (foreign.py) is FOREIGN_OBJECT - a plan item: MUST_FIX
+when that extension is not_applied, CLARIFY otherwise.
+
 Exit code: 0 when every tool ran (conflicts are findings, not errors), 2 on bad input, 3 when the dump command, git or
 the copy of ext into the work copy failed (a half-made work copy is removed).
 
@@ -40,8 +48,8 @@ import uuid
 from collections import Counter
 from datetime import datetime
 
-from . import fileio, metadata, plan as plan_mod, registry
-from .control_rebase import VERDICTS
+from . import fileio, foreign, metadata, plan as plan_mod, registry, selection
+from .control_rebase import VERDICTS, cfg_uuid, ready
 
 BAD_INPUT = 2
 FAILED = 3
@@ -77,7 +85,9 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
         raise PrepareError(BAD_INPUT, "у базы %s в реестре cfe_rebase.proof_corpus: выгрузка расширений %s — эталон "
                                       "(корпус доказательств), её не перевыгружают: запустите prepare с --no-dump "
                                       "(MCP: dump=False)" % (r["db_id"], r["ext"]))
-    for label, root in (("ext", r["ext"]), ("old", r["old"]), ("new", r["new"])):
+    dumps = (("ext", r["ext"]), ("old", r["old"]), ("new", r["new"])) + \
+        ((("ext_all", r["ext_all"]),) if r["ext_all"] else ())
+    for label, root in dumps:
         if _inside(r["work_path"], root):
             raise PrepareError(BAD_INPUT, "рабочая копия %s внутри %s %s: в выгрузке рабочую копию prepare не "
                                           "создаёт и не берёт — задайте cfe_rebase.work вне выгрузок"
@@ -91,8 +101,11 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
         problem = metadata.config_problem(root)  # the same rule the tools apply, before anything is dumped or copied
         if problem:
             raise PrepareError(BAD_INPUT, "нет выгрузки типовой релиза %s (%s) в %s: %s" % (rel, role, root, problem))
+    if r["ext_all"] and not metadata.find_extensions([r["ext_all"]]):
+        raise PrepareError(BAD_INPUT, "в cfe_rebase.ext_all %s нет выгрузок расширений (папок с Configuration.xml): "
+                                      "выгрузите туда все расширения базы или уберите ключ" % r["ext_all"])
     folder = os.path.join(r["out"], "prepare-" + run_id[:8])
-    for label, root in (("ext", r["ext"]), ("old", r["old"]), ("new", r["new"]), ("work", r["work_path"])):
+    for label, root in dumps + (("work", r["work_path"]),):
         if _inside(folder, root):
             raise PrepareError(BAD_INPUT, "папка отчётов %s внутри %s %s: в выгрузки и рабочую копию prepare не пишет"
                                % (r["out"], label, root))
@@ -109,8 +122,13 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
     ctl = data["control_rebase"]
     rows = data["interceptors"]["registry"]
     calls = [f for f in data["calls"]["findings"] if f["flags"]]
+    outside = _outside(r, folder, say) if r["ext_all"] else None
     plan = plan_mod.build(ctl, data["bodies"], data["interceptors"], data["calls"], data["queries"], data["borrowed"],
-                          data["registers"], data["names"])
+                          data["registers"], data["names"], foreign=outside["foreign"] if outside else None)
+    if outside is not None:
+        plan["out_of_perimeter"] = {k: outside[k] for k in ("ext_all", "perimeter", "not_applied", "control_only",
+                                                            "clean")}
+        plan["out_of_perimeter"]["foreign"] = _levels(outside["foreign"])
     plan_json, plan_md = os.path.join(folder, "plan.json"), os.path.join(folder, "plan.md")
     with io.open(plan_json, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(plan, fh, ensure_ascii=False, indent=1)
@@ -141,6 +159,7 @@ def run(db, to, from_=None, registry_path=None, dump=True, names=None, only=None
         "plan": {"counts": plan["counts"], "hidden": sum(plan["hidden"].values()), "json": plan_json, "md": plan_md,
                  "must_fix": [x for x in plan["items"] if x["group"] == "MUST_FIX"]},
         "reports": reports,
+        "out_of_perimeter": outside,
     }
     result["prepare_json"] = os.path.join(folder, "prepare.json")
     with io.open(result["prepare_json"], "w", encoding="utf-8", newline="\n") as fh:
@@ -179,6 +198,9 @@ def screen(res):
     lines.append("отчёты:")
     width = max(len(t) for t in TOOLS)
     lines.extend("  %-*s  %s" % (width, t, res["reports"][t]["md"]) for t in TOOLS)
+    outside = res.get("out_of_perimeter")
+    for t, rep in sorted((outside or {}).get("reports", {}).items()):
+        lines.append("  %-*s  %s" % (width, "вне периметра: " + t, rep["md"]))
     lines.append("plan.md: %s" % res["plan"]["md"])
     lines.append("prepare.json: %s" % res["prepare_json"])
     return "\n".join(lines)
@@ -367,18 +389,91 @@ def _analyze(r, folder, work, only, say):
     }
     reports = {}
     for tool in TOOLS:
-        dest = os.path.join(folder, tool)
         say("%s…" % tool)
-        module = importlib.import_module("." + tool, __package__)
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                module.main(argvs[tool] + ["--out", dest])
-        except SystemExit as exc:
-            if exc.code not in (None, 0):
-                raise PrepareError(BAD_INPUT, "%s: %s" % (tool, exc.code))
-        name = REPORT_NAMES[tool]
-        reports[tool] = {"json": os.path.join(dest, name + ".json"), "md": os.path.join(dest, name + ".md")}
+        reports[tool] = _run_tool(tool, argvs[tool], os.path.join(folder, tool))
     return reports
+
+
+def _run_tool(tool, argv, dest):
+    """One tool of TOOLS into dest; {json, md} of its report."""
+    module = importlib.import_module("." + tool, __package__)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.main(argv + ["--out", dest])
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            raise PrepareError(BAD_INPUT, "%s: %s" % (tool, exc.code))
+    name = REPORT_NAMES[tool]
+    return {"json": os.path.join(dest, name + ".json"), "md": os.path.join(dest, name + ".md")}
+
+
+def _outside(r, folder, say):
+    """The extensions of ext_all outside the perimeter (ext): borrowed and control_rebase into
+    <folder>/out_of_perimeter/<tool>/, judged per extension. An extension of ext_all is in the perimeter when its name
+    or the uuid of its Configuration (it survives a rename: name + date + version) is one of ext."""
+    keys = set()
+    for d in metadata.find_extensions([r["ext"]]):
+        keys.update(k for k in (d.name.casefold(), cfg_uuid(d)) if k)
+    everything = metadata.find_extensions([r["ext_all"]])
+    perimeter = [d.name for d in everything if d.name.casefold() in keys or cfg_uuid(d) in keys]
+    names = [d.name for d in everything if d.name not in perimeter]
+    res = {"ext_all": r["ext_all"], "ext_all_newest": registry.ext_newest(r["ext_all"]), "perimeter": perimeter,
+           "extensions": names, "not_applied": [], "control_only": [], "clean": [], "foreign": [], "reports": {}}
+    if not names:
+        return res
+    dest = os.path.join(folder, "out_of_perimeter")
+    skip = ["--skip"] + perimeter if perimeter else []
+    say("вне периметра: borrowed, control_rebase по %d расширениям…" % len(names))
+    res["reports"]["borrowed"] = _run_tool("borrowed", ["--ext-root", r["ext_all"], "--config-old", r["old"],
+                                                        "--config-new", r["new"]] + skip,
+                                           os.path.join(dest, "borrowed"))
+    res["reports"]["control_rebase"] = _run_tool("control_rebase", ["--ext", r["ext_all"], "--old", r["old"],
+                                                                    "--new", r["new"]] + skip,
+                                                 os.path.join(dest, "control_rebase"))
+    borrowed = sorted(_load(res["reports"]["borrowed"]["json"])["findings"],
+                      key=lambda f: selection.rank("borrowed", f))
+    methods = _load(res["reports"]["control_rebase"]["json"])["methods"]
+    for name in names:
+        errors = ["%s %s: %s" % (f["check"], f["object"], f["detail"]) for f in borrowed
+                  if f["ext"] == name and selection.level("borrowed", f) == "error"]
+        risks = sum(1 for f in borrowed if f["ext"] == name and selection.level("borrowed", f) == "risk")
+        control = ["&ИзменениеИКонтроль %s (%s → %s): %s%s" % (
+            m["ext_method"], m["module_title"], m["target"], m["verdict"], " — %s" % m["note"] if m.get("note") else "")
+            for m in methods if m["ext"] == name and not ready(m)]
+        row = {"ext": name, "borrowed": len(errors), "control": len(control), "risks": risks,
+               "first": (errors + control)[0] if errors or control else None, "reasons": errors + control}
+        if errors:
+            res["not_applied"].append(row)
+        elif control:
+            res["control_only"].append(row)
+        else:
+            res["clean"].append(name)
+    res["foreign"] = _foreign(r, everything, perimeter, res)
+    return res
+
+
+def _foreign(r, everything, perimeter, res):
+    """FOREIGN_OBJECT: references of the perimeter's code to objects only an outside extension adds, one row per
+    extension + module + method + object with its lines; level error when that extension will not be applied, risk
+    when only its &ИзменениеИКонтроль fails, info otherwise."""
+    owners = {x["ext"]: ("error", x) for x in res["not_applied"]}
+    owners.update({x["ext"]: ("risk", x) for x in res["control_only"]})
+    outside = [d for d in everything if d.name not in perimeter]
+    rows = {}
+    for f in foreign.analyze(metadata.find_extensions([r["ext"]]), metadata.Dump(r["new"], "new"), outside):
+        key = (f["ext"], f["module"], f["method"] or "", f["object"])
+        row = rows.setdefault(key, dict(f, lines=[], how=[]))
+        if f["line"] and f["line"] not in row["lines"]:
+            row["lines"].append(f["line"])
+        if f["how"] not in row["how"]:
+            row["how"].append(f["how"])
+    out = []
+    for row in rows.values():
+        level, owner = owners.get(row["owner"], ("info", None))
+        row.pop("line")
+        row.update(check="FOREIGN_OBJECT", level=level, owner_first=owner["first"] if owner else None)
+        out.append(row)
+    return out
 
 
 def _git(args, cwd):
@@ -418,6 +513,12 @@ def _inside(path, root):
 def _same_path(a, b):
     """One folder whatever the spelling: git prints C:/x/y, the registry may give a short 8.3 name or a symlink."""
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _levels(rows):
+    """{error, risk, info} counts of FOREIGN_OBJECT rows."""
+    counts = Counter(x["level"] for x in rows)
+    return {k: counts.get(k, 0) for k in selection.LEVELS}
 
 
 def _flag_counts(rows):

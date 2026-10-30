@@ -610,6 +610,14 @@ def head_uuid(path):
     return m.group(1).decode("ascii", "replace") if m else None
 
 
+def adopted_file(path):
+    """ObjectBelonging Adopted in the object's own properties of an extension's object XML (before <ChildObjects>,
+    where the adopted children of an adopted object say it too); an object without it is the extension's own."""
+    text = fileio.read_text(path)
+    cut = text.find("<ChildObjects>")
+    return "<ObjectBelonging>Adopted</ObjectBelonging>" in (text if cut < 0 else text[:cut])
+
+
 def counterpart_name(src, kind, name, dump):
     """Name in `dump` of the object (kind, name) of the extension dump `src`, or None when dump has none. The vendor
     keeps the uuid when it renames an object: a configuration is matched by ExtendedConfigurationObject of the

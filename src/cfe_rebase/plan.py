@@ -16,9 +16,11 @@ One item per extension + module + method (or call site / query place), grouped:
              included (OWNER_REMOVED / OWNER_RENAMED), a dynamic list whose query the extension replaces without a
              field the new vendor form needs (names: LIST_QUERY_FIELD_MISSING), an object module of the extension
              that reads a field the vendor added in new without adopting it (names: FIELD_NOT_ADOPTED), a
-             CompatibilityMode of the extension that differs from new (borrowed: COMPAT_MODE);
+             CompatibilityMode of the extension that differs from new (borrowed: COMPAT_MODE), an object the extension
+             owns under the name of a vendor object of the same kind new brought (borrowed: OBJECT_NAME_CLASH);
   REVIEW  - defects that were there before the update too (a call or a query that did not resolve in old either, a
-             list field the old vendor form needed as well, a field read without adoption that old had too),
+             list field the old vendor form needed as well, a field read without adoption that old had too, an own
+             object named as a vendor object old had already),
              and MUST_FIX items in code nothing live calls (no references, or references only from such code);
   CLARIFY  - questions of design: the same target in several extensions, CALLERS_LOST of a method with many vendor
              callers or lost only with the vendor methods that called it, a base method new in this release, an
@@ -67,6 +69,11 @@ INT_MUST = {"SIGNATURE_CHANGED": "сигнатура базового метод
 FEW_CALLERS = 10
 CALLERS_LOST_MANY = ("код вендора в new перестал вызывать базовый метод на части путей (callers_lost), а вызывающих "
                      "его мест много (%d в old) — проверить, нужна ли доработка на потерянных путях")
+# the vendor replaced the call systematically by a method of the target's own module (interceptors.replacement): a
+# fix whatever the number of callers - a real case: ЗаполнитьМенеджера -> УстановитьМенеджера, 39 of 39, the manager of a new
+# order became the current user on 11.5.27 (proven on the data)
+CALLERS_LOST_SWAP = ("вендор заменил вызов базового метода: %d из %d потерянных мест в new вызывают %s — перенести "
+                     "доработку на него")
 CALLERS_LOST_GONE = ("код вендора в new перестал вызывать базовый метод: вызывавшие его методы вендор удалил "
                      "(callers_lost, method_in_new: false) — проверить, куда перенесена их логика и нужна ли там "
                      "доработка")
@@ -145,7 +152,12 @@ def _interceptors(p, icp):
         args = (r["ext"], r["module"], r["ext_method"])
         shown = False
         for f in r.get("flags") or []:
-            if f == "CALLERS_LOST" and (r.get("vendor_callers") or {}).get("old", 0) > FEW_CALLERS:
+            swap = r.get("replacement") or {}
+            if f == "CALLERS_LOST" and swap.get("same_owner"):
+                p.add("MUST_FIX", *args, CALLERS_LOST_SWAP % (swap["callers"], swap["of"], swap["method"]),
+                      "interceptors:" + f, r.get("module_title"))
+                shown = True
+            elif f == "CALLERS_LOST" and (r.get("vendor_callers") or {}).get("old", 0) > FEW_CALLERS:
                 p.add("CLARIFY", *args, CALLERS_LOST_MANY % r["vendor_callers"]["old"], "interceptors:" + f,
                       r.get("module_title"))
                 shown = True
@@ -180,7 +192,10 @@ def _calls(p, calls):
         copy = f.get("copy")
         dep_risk = (f.get("deprecated") or {}).get("grade") == "risk"
         rest = [x for x in flags if x != "CALLS_DEPRECATED"]
-        if copy and copy.get("target_in_new") and copy.get("vendor_old") and not copy.get("vendor_new"):
+        if flags == ["STRUCT_KEY_NEW"]:  # error and risk alike: the vendor reads a key the structure lacks
+            p.add("MUST_FIX", *args, what + ("; " + f["advice"] if f.get("advice") else ""), "calls:STRUCT_KEY_NEW",
+                  f.get("module_title"))
+        elif copy and copy.get("target_in_new") and copy.get("vendor_old") and not copy.get("vendor_new"):
             p.add("MUST_FIX", *args, "в копии есть вызовы, которые вендор в new убрал — уйдут пересъёмкой копии",
                   "calls:" + ",".join(flags) + ":fixed_by_report", f.get("module_title"))
         elif not rest or (rest == ["SIGNATURE_CHANGED"] and not f.get("note", "").startswith("[риск]")):
@@ -235,8 +250,12 @@ def _borrowed(p, borrowed):
         what = f["detail"] + ("; формы расширения с этим полем: " + ", ".join(f["forms"]) if f.get("forms") else "")
         # an XML that does not parse is not judged: the file is to be looked at, not the adoption fixed
         group = "CLARIFY" if f["check"] in ("NOT_IN_VENDOR", "XML_UNREADABLE") else "MUST_FIX"
-        # the extension's own Configuration.xml is not an adoption of a vendor object
-        head = "расширение" if f["check"] == "COMPAT_MODE" else "заимствование %s" % f["object"]
+        # a vendor object of that name already in old: the clash was there before the update
+        if f["check"] == "OBJECT_NAME_CLASH" and f.get("in_old"):
+            group = "REVIEW"
+        # the extension's own Configuration.xml and its own objects are not adoptions of a vendor object
+        head = "расширение" if f["check"] == "COMPAT_MODE" else "собственный объект %s" % f["object"] \
+            if f["check"] == "OBJECT_NAME_CLASH" else "заимствование %s" % f["object"]
         p.add(group, f["ext"], f["file"], None, "%s: %s" % (head, what), "borrowed:" + f["check"], f["object"])
 
 
@@ -272,13 +291,36 @@ def _names(p, names):
         p.add(group, f["ext"], f["module"], method, f["detail"], "names:" + f["check"], f.get("form"))
 
 
-def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None, names=None):
+FOREIGN_WHAT = {
+    "error": "обращение к %(object)s (стр. %(lines)s) — объект расширения %(owner)s вне периметра, а оно на new не "
+             "применится (%(first)s): здесь будет «Поле объекта не обнаружено» — перенести %(owner)s или читать "
+             "объект с проверкой наличия в метаданных",
+    "risk": "обращение к %(object)s (стр. %(lines)s) — объект расширения %(owner)s вне периметра; у него на new не "
+            "проходит &ИзменениеИКонтроль (%(first)s) — применится ли, не доказано",
+    "info": "обращение к %(object)s (стр. %(lines)s) — объект расширения %(owner)s вне периметра: работает, пока "
+            "%(owner)s подключено и применяется",
+}
+
+
+def _foreign(p, foreign):
+    """FOREIGN_OBJECT of prepare (the perimeter's code reaches for an object only an outside extension adds): an
+    extension that will not be applied - MUST_FIX, otherwise CLARIFY."""
+    for f in foreign or []:
+        what = FOREIGN_WHAT[f["level"]] % {"object": f["object"], "owner": f["owner"],
+                                           "lines": ", ".join(str(x) for x in f["lines"]) or "?",
+                                           "first": cut(f.get("owner_first") or "", 160)}
+        p.add("MUST_FIX" if f["level"] == "error" else "CLARIFY", f["ext"], f["module"], f["method"], what,
+              "out_of_perimeter:FOREIGN_OBJECT", file_title(f["module"]))
+
+
+def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None, names=None, foreign=None):
     """{'items': [...], 'counts': {group: n}, 'hidden': {kind: n}, 'not_covered': text}; items are ordered by group,
     then extension and module. A MUST_FIX item in code no extension calls (UNBOUND, or a caller without references)
     goes to REVIEW with a note; so does one whose method is referenced only from such code (refs.liveness: the
     caller_live of calls, the method_live of queries and registers). borrowed - the report of borrowed.py (adopted metadata against new), registers - of
     registers.py (writes to registers whose structure changed), names - of names.py (only LIST_QUERY_FIELD_MISSING,
-    LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED are taken); all three optional."""
+    LIST_FIELD_NOT_LOADED and FIELD_NOT_ADOPTED are taken); all three optional. foreign - FOREIGN_OBJECT rows of
+    prepare (out of the perimeter)."""
     p = Plan()
     _control(p, ctl)
     _bodies(p, bodies)
@@ -288,6 +330,7 @@ def build(ctl, bodies, icp, calls, queries, borrowed=None, registers=None, names
     _borrowed(p, borrowed)
     _registers(p, registers)
     _names(p, names)
+    _foreign(p, foreign)
     dead = {(d["ext"], d["module"], d["method"]) for d in (icp.get("dead_code") or {}).get("UNBOUND", [])}
     dead |= {(f["ext"], f["module"], f.get("caller") or "") for f in calls.get("findings", [])
              if f.get("caller_live") in refs.DEAD}
@@ -333,7 +376,42 @@ def render(plan, title):
             cell = "<br>".join(w.replace("|", "\\|") for w in x["what"])
             md.append("| %s | %s | %s | %s |" % (x["ext"], x["module_title"] or x["module"] or "—", x["method"] or "—",
                                                  cell))
+    if plan.get("out_of_perimeter"):
+        md.extend(_outside_md(plan["out_of_perimeter"]))
     return "\n".join(md)
+
+
+OUTSIDE_NOT_COVERED = ("проход вне периметра — только заимствования (borrowed) и &ИзменениеИКонтроль (control_rebase): "
+                       "сигнатуры &Перед / &После / &Вместо, вызовы, запросы и записи в регистры этих расширений не "
+                       "проверялись; FOREIGN_OBJECT ищет только объекты (Коллекция.Имя в коде, Вид.Имя в запросах), "
+                       "не реквизиты, которые эти расширения добавили к объектам вендора")
+
+
+def _outside_md(o):
+    """The section of the extensions outside the perimeter: never mixed with the items above."""
+    def table(rows):
+        out = ["| Расширение | Ошибок заимствований | &ИзменениеИКонтроль не проходят | Первая причина |",
+               "|---|---|---|---|"]
+        out.extend("| %s | %d | %d | %s |" % (x["ext"], x["borrowed"], x["control"],
+                                              cut(x["first"], 300).replace("|", "\\|")) for x in rows)
+        return out
+
+    md = ["", "## Вне периметра — не применятся — %d" % len(o["not_applied"]), "",
+          "Расширения базы из `%s`, которых нет в периметре задачи%s. Не пункты плана: их правка — отдельная задача."
+          % (o["ext_all"], " (в периметре: %s)" % ", ".join(o["perimeter"]) if o["perimeter"] else ""), ""]
+    md.extend(table(o["not_applied"]) if o["not_applied"] else ["Нет."])
+    md.extend(["", "### Только &ИзменениеИКонтроль не проходит контроль — %d" % len(o["control_only"]), "",
+               "Проверка применимости платформы назовёт это ошибкой; не применится ли расширение из-за одного этого — "
+               "не доказано.", ""])
+    md.extend(table(o["control_only"]) if o["control_only"] else ["Нет."])
+    md.extend(["", "Без ошибок заимствований и контроля: " + (", ".join(o["clean"]) or "нет") + "."])
+    fo = o.get("foreign") or {}
+    if any(fo.values()):
+        md.extend(["", "Код периметра обращается к объектам этих расширений (FOREIGN_OBJECT, пункты — в плане выше): "
+                   "к не применяющимся — %d, к расширениям, у которых не проходит только &ИзменениеИКонтроль, — %d, "
+                   "к остальным — %d." % (fo.get("error", 0), fo.get("risk", 0), fo.get("info", 0))])
+    md.extend(["", "**Не покрыто:** " + OUTSIDE_NOT_COVERED + "."])
+    return md
 
 
 def screen_lines(plan, limit=40):
@@ -347,4 +425,19 @@ def screen_lines(plan, limit=40):
     if len(must) > limit:
         lines.append("  … ещё %d — в plan.md" % (len(must) - limit))
     lines.append("  " + plan["not_covered"])
+    o = plan.get("out_of_perimeter")
+    if o:
+        lines.append("вне периметра (%s): не применятся %d, только &ИзменениеИКонтроль %d, без ошибок %d" % (
+            o["ext_all"], len(o["not_applied"]), len(o["control_only"]), len(o["clean"])))
+        for x in (o["not_applied"] + o["control_only"])[:limit]:
+            lines.append("  - %s: %s" % (x["ext"], cut(x["first"])))
+        fo = o.get("foreign") or {}
+        if any(fo.values()):
+            lines.append("  код периметра обращается к их объектам (FOREIGN_OBJECT): error %d, risk %d, info %d" % (
+                fo.get("error", 0), fo.get("risk", 0), fo.get("info", 0)))
     return lines
+
+
+def cut(text, limit=200):
+    """A one-line reason no longer than limit characters."""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"

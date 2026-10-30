@@ -27,8 +27,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Any
 
-from . import (__version__, control_rebase, fileio, metadata, prepare as prep, registry as db_registry, selection,
-               structure)
+from . import (__version__, control_rebase, fileio, metadata, plan as plan_mod, prepare as prep,
+               registry as db_registry, selection, structure)
 
 SERVER_NAME = "cfe-rebase"
 INSTALL_HINT = ("cfe-rebase mcp: не установлен MCP SDK (пакет mcp). Установите extra:\n"
@@ -60,7 +60,10 @@ INSTRUCTIONS = (
     "check_copies (рабочая копия как ext_root, каждая копия &Вместо pass), "
     "check_calls, check_queries, check_borrowed, check_registers, check_names (рабочая копия как ext_root), check_work "
     "(errors = 0); check_reads (рабочая копия как ext_root) — информационно: регистры вендора, которые запросы "
-    "расширений читают и у которых изменились состав или регистраторы, смотреть глазами. Не видят: копии СКД и "
+    "расширений читают и у которых изменились состав или регистраторы, смотреть глазами; check_template_params "
+    "(рабочая копия как ext_root) — параметры макетов вендора, которые релиз убрал или переименовал (ячейка со "
+    "старым именем печатается пустой без ошибки): код и макеты расширений со старым именем, печатные макеты для "
+    "сверки пользовательских макетов базы — запрос в snippet. Не видят: копии СКД и "
     "макетов вендора под другим именем, запись в регистр через ЗаполнитьЗначенияСвойств или структуру, чтение "
     "регистра через менеджер (РегистрыНакопления.X.Остатки()) — их сверять по тексту.")
 
@@ -73,15 +76,21 @@ INTERCEPTOR_FIELDS = ("id", "ext", "module_title", "source", "kind", "target", "
                       "ann_line", "ext_line", "base_line_old", "base_line_new", "callType", "owner_kind", "owner",
                       "event", "own_element", "xml_line", "deprecated", "vendor_calls", "vendor_callers",
                       "callers_lost", "callers_new", "vendor_mentions",
-                      "callers_moved_deeper")
+                      "callers_moved_deeper", "replacement")
 CALL_FIELDS = ("ext", "module_title", "line", "caller", "call", "args", "target", "flags", "note", "deprecated", "copy",
-               "advice", "owner")
+               "advice", "owner", "struct_key")
 QUERY_FIELDS = ("part", "kind", "sev", "ext", "where", "line", "ref", "note", "old")
 REGISTER_FIELDS = ("ext", "module_title", "line", "method", "register", "how", "check", "added", "missing", "stale",
                    "to_dims", "to_res", "key_lost", "callers", "detail")
 READ_FIELDS = ("ext", "register", "check", "sev", "dims_added", "dims_removed", "res_added", "res_removed",
                "attrs_added", "attrs_removed", "type_changed", "props_changed", "recorders_added",
                "recorders_removed", "reads", "detail")
+TEMPLATE_PARAM_FIELDS = ("ext", "template", "check", "sev", "renamed", "gone", "added", "places", "templates",
+                         "detail")
+TEMPLATE_PARAM_STATS = ("extensions", "spreadsheets", "spreadsheets_changed", "with_gone", "print_with_gone",
+                        "print_with_renamed", "added_only", "renamed_pairs", "templates_removed", "unreadable",
+                        "code_old_name", "template_old_name", "vendor_renamed", "copy_old_name", "vendor_gone")
+TEMPLATE_PLACES_MAX = 5
 APPLIED_LINE = re.compile(r"^(?P<rel>.+): опустошено строк (?P<n>\d+)$")
 # Serialized size of a list in one answer, characters. A trial run (16.10.2026, 2 extensions of a real base) got 43k characters
 # from list_interceptors (~15k tokens, over the 10k warning of Claude Code) in five steps; 20 extensions would pass
@@ -136,7 +145,7 @@ class _Run(object):
 
 
 def _execute(tool, inputs, paths, body, fill=None):
-    """The response envelope around body(run) -> {summary, items, report, dead_code, unjudged, ext_newest}.
+    """The response envelope around body(run) -> {summary, items, report, dead_code, unjudged, ext_newest, snippet}.
 
     paths: {argument: path or [paths]} that must be absolute and exist, or a function returning it (called after
     fill). fill() -> extra envelope fields: completes inputs in place (paths from the registry of databases)."""
@@ -164,7 +173,7 @@ def _execute(tool, inputs, paths, body, fill=None):
         if console:
             env["console"] = console
     env["inputs"] = inputs
-    for key in ("ext_newest", "summary", "items", "report", "dead_code", "unjudged", "unreadable_forms"):
+    for key in ("ext_newest", "summary", "items", "report", "dead_code", "unjudged", "unreadable_forms", "snippet"):
         if payload.get(key) not in (None, "", [], {}):
             env[key] = payload[key]
     cut = {}
@@ -527,7 +536,9 @@ def list_interceptors(ext_root: list[str] | None = None, config_old: str | None 
     вызовов в new нет, но метод упоминается через переменную (МенеджерОбъекта.Метод) или полным именем в строке
     (ИмяМетода отложенного задания) — CALLERS_LOST вместо TARGET_UNCALLED и vendor_mentions [{title, line, how}];
     вызывающий, который в new доходит до цели через методы вендора не глубже трёх вызовов (свой модуль, общие
-    модули, менеджеры), не потерян — callers_moved_deeper [{file, method, title, line_old, via}]),
+    модули, менеджеры), не потерян — callers_moved_deeper [{file, method, title, line_old, via}]; replacement
+    {method, callers, of, same_owner} — почти все потерянные места (не меньше 3, 80%) в new вызывают один метод:
+    вендор заменил вызов, перенести доработку на него; в плане «исправить», если метод в модуле цели),
     notes,
     директивы, сигнатуры (base_sig_old — только если отличается от new),
     номера строк: ann_line / ext_line — в модуле расширения, base_line_old / base_line_new — в модулях вендора;
@@ -937,7 +948,14 @@ def check_calls(ext_root: list[str] | None = None, config_old: str | None = None
     нет; MISSING — нет ни там, ни там; NOT_EXPORT; TOO_FEW_ARGS; TOO_MANY_ARGS; SIGNATURE_CHANGED; CALLS_DEPRECATED —
     вендор пометил метод устаревшим в этом релизе, deprecated {new — область или комментарий, vendor_calls_new —
     сколько раз его вызывает сам вендор в new, grade: risk, info — вендор сам вызывает}; устаревшие и в old — только
-    счётом в report), grade у
+    счётом в report); STRUCT_KEY_NEW — метод вендора в new читает ключ параметра-структуры (<Параметр>.<Ключ>, без
+    проверки Свойство и без присваивания ключу в теле, с методами, которым он передаёт параметр, на уровень глубже),
+    которого в old не читал, а расширение строит эту структуру само (Новый Структура + Вставить в вызывающем методе) без
+    этого ключа: «Поле объекта не обнаружено»; отдельная строка с struct_key {grade: error — ключи литералом и
+    структура до вызова никуда не передаётся, risk — иначе; arg, param, var, built_line, keys, reads [{key, module,
+    method, line}], vendor_puts — где вендор в new кладёт ключ сам, passed_on}, advice — переснять копию, если вызов
+    в копии &Вместо / &ИзменениеИКонтроль, а вендор кладёт ключ в самом перехваченном методе; структура из параметра
+    или функции не судится (только счёт struct_key_unchecked в report), grade у
     SIGNATURE_CHANGED: risk | info (info — вызов совместим, в том числе когда у параметров сменились только имена:
     число, порядок, Знач и умолчания прежние), note — пояснение. Вызов внутри копии &Вместо / &ИзменениеИКонтроль в заимствованном
     модуле — ещё copy {annotation, target_in_new (перехватываемый метод есть в new), vendor_old / vendor_new (тот же
@@ -947,9 +965,9 @@ def check_calls(ext_root: list[str] | None = None, config_old: str | None = None
     модулей, in_copies, fixed_by_report (уйдут пересъёмкой копии). Сигнатуры old/new и разбор по видам вызовов —
     report.md.
     Выборка — общие параметры, описаны в конце: flag — флаги и risk / info у SIGNATURE_CHANGED; уровни severity:
-    error — OWNER_REMOVED, OWNER_RENAMED, REMOVED, MISSING, NOT_EXPORT, TOO_FEW_ARGS, TOO_MANY_ARGS; risk —
-    SIGNATURE_CHANGED risk, CALLS_DEPRECATED risk; info — SIGNATURE_CHANGED info (вызов совместим), CALLS_DEPRECATED
-    info; ключ — ext|module|caller|call|flags."""
+    error — OWNER_REMOVED, OWNER_RENAMED, REMOVED, MISSING, NOT_EXPORT, TOO_FEW_ARGS, TOO_MANY_ARGS, STRUCT_KEY_NEW
+    error; risk — SIGNATURE_CHANGED risk, CALLS_DEPRECATED risk, STRUCT_KEY_NEW risk; info — SIGNATURE_CHANGED info
+    (вызов совместим), CALLS_DEPRECATED info; ключ — ext|module|caller|call|flags."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
               "db": db, "to": to, "from_release": from_release, "registry": registry, "module": module,
               "object": object, "flag": flag, "severity": severity, "baseline": baseline, "accepted": accepted}
@@ -969,6 +987,7 @@ def check_calls(ext_root: list[str] | None = None, config_old: str | None = None
         copies = [f["copy"] for f in flagged if f.get("copy")]
         summary = {"findings": len(flagged), "flags": _flag_counts(flagged),
                    "signature_changed": {"risk": grades["risk"], "info": grades["info"]},
+                   "struct_key": dict(Counter(f["struct_key"]["grade"] for f in flagged if f.get("struct_key"))),
                    "extensions": len(data["extensions"]), "modules": data["stats"].get("modules", 0),
                    "in_copies": len(copies),
                    "fixed_by_report": sum(1 for c in copies if c["target_in_new"] and c["vendor_old"] and
@@ -1106,6 +1125,10 @@ def check_borrowed(ext_root: list[str] | None = None, config_old: str | None = N
     detail — вызов cfe-borrow); свойства, которые расширение меняет само (синоним, представления, основные формы и
     схема, состав подсистемы и движения документа, типы критерия отбора), и значения расширения, отличные от old, не
     сверяются; NAME_CLASH — собственный реквизит или табличная часть расширения совпали по имени с новым полем вендора;
+    OBJECT_NAME_CLASH — собственный (не заимствованный) объект расширения совпал по имени с объектом вендора того же
+    вида в new (vendor_name — имя у вендора; сравнение внутри вида: у самой типовой разные виды носят одно имя):
+    платформа не применит расширение «Уже существует объект с именем Вид.Имя»; in_old: true — объект вендора был и в
+    old, коллизия не от обновления (в плане — «проверить»);
     NOT_IN_VENDOR — поля нет ни в old, ни в new (доработанная конфигурация базы или поле другого расширения — уточнить,
     не ошибка обновления); колонки заимствованных табличных частей — по тем же правилам; LIST_FIELD_LOST — вендор
     изменил запрос динамического списка заимствованной формы, и новый запрос не
@@ -1121,7 +1144,8 @@ def check_borrowed(ext_root: list[str] | None = None, config_old: str | None = N
     учёта регистра.
     summary — счёты по проверкам, расширений и заимствованных объектов.
     Выборка — общие параметры, описаны в конце: flag — check; уровни severity: error — COMPAT_MODE, OBJECT_REMOVED,
-    OBJECT_RENAMED, REMOVED, RENAMED, TYPE_CHANGED, PROPERTY_CHANGED, LIST_FIELD_LOST, NAME_CLASH; risk —
+    OBJECT_RENAMED, OBJECT_NAME_CLASH, REMOVED, RENAMED, TYPE_CHANGED, PROPERTY_CHANGED, LIST_FIELD_LOST, NAME_CLASH;
+    risk —
     XML_UNREADABLE, LIST_CHANGED; info — NOT_IN_VENDOR; ключ —
     ext|object|part|name|check."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
@@ -1137,7 +1161,8 @@ def check_borrowed(ext_root: list[str] | None = None, config_old: str | None = N
 
         def shape(f, roots_):
             return _compact(dict({k: f.get(k) for k in ("ext", "object", "file", "part", "name", "new_name", "check",
-                                                         "ext_value", "new_value", "detail", "forms")},
+                                                         "ext_value", "new_value", "vendor_name", "in_old", "detail",
+                                                         "forms")},
                                  path=_join(roots_.get(f["ext"]), f["file"])))
 
         dest = run.folder(out)
@@ -1454,6 +1479,88 @@ def check_reads(ext_root: list[str] | None = None, config_old: str | None = None
                     body, _from_registry(inputs, DUMP_KEYS, DUMP_KEYS))
 
 
+def check_template_params(ext_root: list[str] | None = None, config_old: str | None = None,
+                          config_new: str | None = None, out: str | None = None, skip: list[str] = [],
+                          db: str | None = None, to: str | None = None, from_release: str | None = None,
+                          registry: str | None = None, module: str | None = None, object: str | None = None,
+                          flag: list[str] | None = None, severity: str | None = None, baseline: str | None = None,
+                          accepted: str | None = None) -> dict[str, Any]:
+    """Параметры табличных макетов вендора, которые новый релиз убрал или переименовал (`template-params`). Область
+    заполняется по имени параметра; имени, которого в области нет, платформа не замечает — ячейка печатается пустой,
+    ошибки нет (реальный случай: пользовательский макет ПФ_MXL_РасходныйОрдерНаТовары с 11.5.17, вендор 11.5.27 переименовал
+    ПредставлениеЕдининицыИзмеренияУпаковки → ПредставлениеЕдиницыИзмеренияУпаковки, единица упаковки на печати
+    пустая). Старые имена держат пользовательские макеты базы, макеты расширений и код расширений.
+
+    ext_root — папки выгрузок расширений; config_old / config_new — выгрузки типовой; skip — расширения, которые
+    пропустить. db / to / from_release / registry — пути из реестра баз (явные перекрывают).
+
+    Имена макета — <parameter>, <detailParameter> и [Имя] в тексте ячейки с заполнением «Шаблон» (выражение в
+    скобках и сноска [1] — не имена); сравнение без учёта регистра. Пара «переименован» — в одном макете убранное и
+    новое имя на расстоянии правки ≤ 2, длиной от 8 символов, различие не только в цифрах, ячеек поровну, у обоих
+    имён кандидат единственный; иначе — убрано плюс новое.
+
+    items — ext (пусто у строк вендора), template (Вид.Объект.Макет или ОбщийМакет.Макет), check, sev, renamed
+    ({old, new, cells}), gone ({name, cells}), added ({name, cells}), places (где код расширения пишет имя: path, rel,
+    line, name, how — Параметры.<Имя>, Параметры["<Имя>"] или «строка»; первые 5, всего — places_total), templates
+    (макеты расширения со старым именем: path, rel, template, names, borrowed), detail. Пустые списки не передаются.
+    check: CODE_OLD_NAME (РИСК) — модуль расширения (модули объекта макета; для общего макета — все) пишет убранное
+    имя: Параметры.<Имя> / Параметры["<Имя>"]; у переименованного и слово в строке (ключ структуры, псевдоним
+    запроса), если модули не пишут ни одного нового имени через Параметры; TEMPLATE_OLD_NAME (РИСК) — макет
+    расширения того же объекта действительно печатает старое имя: заимствованный макет, содержимое которого платформа
+    использует (InternalInfo: Template = Extended; в режиме «Объединять» — только если в листе расширения имя в большем
+    числе ячеек, чем в baseSheet: нетронутая ячейка при слиянии берёт новое значение вендора), или собственная копия,
+    когда код пишет новое имя и берёт из копии по имени область (ПолучитьОбласть) с ячейкой старого имени;
+    COPY_OLD_NAME (ПРОВЕРИТЬ) — копия со старым именем при коде на новом, но ячейка вне областей, которые код берёт из
+    копии (или код не берёт областей по имени): проверить, читается ли область с параметром из копии; templates — с
+    merge (режим «Объединять») и areas_used (области копии, которые берёт код); VENDOR_RENAMED (РИСК) — печатный
+    макет вендора («ПФ_» в имени, как его видит БСП) с переименованием:
+    проверить пользовательские макеты базы; VENDOR_GONE (ПРОВЕРИТЬ) — то же с убранными именами без пары. Макеты
+    только с новыми именами не перечисляются (счёт в summary). snippet — запрос для тулкита к
+    РегистрСведений.ПользовательскиеМакетыПечати по печатным макетам находок (Объект, ИмяМакета, Использование); сам
+    инструмент базу не трогает.
+    summary — extensions, spreadsheets (табличных макетов в обоих релизах), spreadsheets_changed, with_gone,
+    print_with_gone, print_with_renamed, added_only, renamed_pairs, templates_removed, unreadable и число находок по
+    check (code_old_name, template_old_name, vendor_renamed, copy_old_name, vendor_gone).
+    Выборка — общие параметры, описаны в конце: module — по путям макета, мест в коде и макетов расширения; object —
+    макет или его объект; flag — check или sev; уровни severity: risk — всё, кроме VENDOR_GONE и COPY_OLD_NAME
+    (info); ключ —
+    ext|template|check."""
+    inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
+              "db": db, "to": to, "from_release": from_release, "registry": registry, "module": module,
+              "object": object, "flag": flag, "severity": severity, "baseline": baseline, "accepted": accepted}
+
+    def body(run):
+        ext_root, config_old, config_new, out = _take(inputs, "ext_root", "config_old", "config_new", "out")
+        _require_out(out)
+
+        def rerun(roots_, dest_):
+            return _dump_run(run, "template_params", "template-params", roots_, config_old, config_new, dest_, skip)
+
+        dest = run.folder(out)
+        data, roots = rerun(ext_root, dest)
+        picked = _selected("template-params", data, roots, data["findings"], lambda f, _: _template_param_item(f),
+                           inputs, dest, rerun)
+        summary = {k: data["stats"].get(k, 0) for k in TEMPLATE_PARAM_STATS}
+        summary, report = _with_selection(summary, _report(dest, "template-params"), picked)
+        res = {"summary": summary, "items": picked["items"], "ranks": picked["ranks"], "report": report}
+        if data.get("snippet"):
+            res["snippet"] = data["snippet"]
+        return res
+
+    return _execute("check_template_params", inputs,
+                    lambda: dict(_take_dict(inputs, "ext_root", "config_old", "config_new"), **_sel_paths(inputs)),
+                    body, _from_registry(inputs, DUMP_KEYS, DUMP_KEYS))
+
+
+def _template_param_item(f):
+    it = {k: f.get(k) for k in TEMPLATE_PARAM_FIELDS}
+    places = f.get("places") or []
+    it["places"] = places[:TEMPLATE_PLACES_MAX]
+    if len(places) > TEMPLATE_PLACES_MAX:
+        it["places_total"] = len(places)
+    return _compact(it)
+
+
 def _read_type(t):
     """type_changed of reads.json for the answer: a long composite type as what came and what left."""
     if len(t.get("old") or "") + len(t.get("new") or "") <= READ_TYPE_TEXT_MAX:
@@ -1492,8 +1599,8 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
     до переименования тоже подходит); out — папка отчёта вне рабочей копии и вне ext. db / registry — work, ext и out
     из реестра баз (релиз не нужен).
 
-    items — находки, сначала ошибки: ext, file (путь от расширения), path, line, check, severity (error | info),
-    detail. Проверки: MERGE_MARKER / MERGE_MARKER_ORPHAN (маркеры конфликта слияния в любом текстовом файле),
+    items — находки, сначала ошибки, потом риски: ext, file (путь от расширения), path, line, check, severity (error |
+    risk | info), detail. Проверки: MERGE_MARKER / MERGE_MARKER_ORPHAN (маркеры конфликта слияния в любом текстовом файле),
     MARKER_* (#Вставка/#Удаление: не закрыт, пересекается, без пары, вне метода, в методе без &ИзменениеИКонтроль,
     неизвестное написание), METHOD_* (не закрыт, конец без начала, Процедура закрыта КонецФункции), ANNOTATION_*
     (аннотация перехвата без метода, без цели, несколько), DUP_METHOD, PREPROC_UNBALANCED (незакрытый #Если — по
@@ -1509,11 +1616,17 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
     modify-property Name роли не правит, платформа откажет «Неизвестный объект метаданных - Configuration.<старое
     имя>» по разу на роль; old_name, new_name, line — первая ссылка) и EXT_NAME_STALE_DUMP_INFO (info: то же в
     ConfigDumpInfo.xml, записи Configuration.<имя> и Configuration.<имя>.<модуль>; полная загрузка на нём не
-    отказала — проверено на реальных загрузках, править вместе с ролями). Номера строк — по CR LF, LF и CR, как в
-    файле.
-    summary — расширений, файлов, модулей, errors, info, счёт по проверкам; without_source и without_source_names —
-    расширения рабочей копии без пары в ext (для них только проверка структуры, файлы не сверялись).
-    Выборка — общие параметры, описаны в конце: flag — check или severity; уровни severity: error | info, как у
+    отказала — проверено на реальных загрузках, править вместе с ролями) и ROLE_NO_RIGHTS (risk: у собственной роли
+    нет Roles/<Роль>/Ext/Rights.xml, а у расширения есть собственные объекты, на которые роли дают права; file —
+    Roles/<Роль>.xml, role, own_objects — их число: загрузка из XML создаст роль пустой — реальный случай, 130 прав
+    → 0; если в базе-источнике права заданы флагом «Устанавливать права для новых объектов» — создать Rights.xml с
+    setForNewObjects=true, setForAttributesByDefault=true, independentRightsOfChildObjects=false, без <object>; по
+    выгрузке не отличить от роли, у которой прав нет, — решает база-источник; заимствованная роль без Rights.xml не
+    находка). Номера строк — по CR LF, LF и CR, как в файле.
+    summary — расширений, файлов, модулей, errors, risk, info, счёт по проверкам; without_source и
+    without_source_names — расширения рабочей копии без пары в ext (для них только проверка структуры, файлы не
+    сверялись).
+    Выборка — общие параметры, описаны в конце: flag — check или severity; уровни severity: error | risk | info, как у
     находки; baseline — только отчёт прошлого check_work (lint.json или его папка), не выгрузка; ключ —
     ext|file|check."""
     inputs = {"work": work, "ext": ext, "out": out, "only": only, "db": db, "registry": registry, "module": module,
@@ -1528,8 +1641,8 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
         run.call("lint", argv)
         data = _load(os.path.join(dest, "lint.json"))
         issues = data["issues"]
-        errors = sum(1 for x in issues if x["severity"] == "error")
-        summary = dict(data["stats"], errors=errors, info=len(issues) - errors,
+        levels = Counter(x["severity"] for x in issues)
+        summary = dict(data["stats"], errors=levels["error"], risk=levels["risk"], info=levels["info"],
                        checks=dict(sorted(Counter(x["check"] for x in issues).items())))
 
         def rerun(_roots, _dest):
@@ -1537,7 +1650,7 @@ def check_work(work: str | None = None, ext: str | None = None, out: str | None 
 
         picked = _selected("lint", data, {}, issues, lambda x, _: _compact(
             {k: x.get(k) for k in ("ext", "file", "path", "line", "check", "severity", "detail", "old_name",
-                                   "new_name")}), inputs, dest, rerun)
+                                   "new_name", "role", "own_objects")}), inputs, dest, rerun)
         summary, report = _with_selection(summary, _report(dest, "lint"), picked)
         return {"summary": summary, "items": picked["items"], "ranks": picked["ranks"], "report": report}
 
@@ -1718,8 +1831,20 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
     скрыто как шум). items — пункты MUST_FIX плана: ext, module, module_title, method, what (что произошло и что
     делать). План не покрывает собственные копии СКД и макетов вендора под другим именем и запись в регистры через
     ЗаполнитьЗначенияСвойств или структуру — их сверять по тексту. report — json (prepare.json), plan {json, md} и
-    {json, md} каждого из восьми отчётов. Ошибки: bad_input (до любого запуска) — реестр, релиз, рабочая копия без git
-    или не корень своего git-репозитория, рабочая копия внутри ext / old / new или ext внутри рабочей копии,
+    {json, md} каждого из восьми отчётов.
+    Вне периметра: если у базы в реестре есть cfe_rebase.ext_all (выгрузка всех расширений базы; prepare её не
+    выгружает), расширения оттуда, которых нет в ext (сверка по имени и по uuid Configuration — он переживает
+    переименование), проходят borrowed и control_rebase (report.out_of_perimeter); в plan.md — отдельный раздел, в
+    пункты плана они не входят. summary.out_of_perimeter — ext_all, ext_all_newest, perimeter (имена в ext_all,
+    совпавшие с периметром), extensions (сколько вне периметра), not_applied (ошибка заимствования — платформа не
+    применит) и control_only (только &ИзменениеИКонтроль не проходит контроль; не применится ли — не доказано): по
+    строке ext, borrowed, control (счёты ошибок), first (первая причина); clean — сколько без ошибок; foreign
+    {error, risk, info} — FOREIGN_OBJECT: код периметра обращается к объекту (Коллекция.Имя в коде, Вид.Имя в
+    запросах), которого нет ни в new, ни в периметре, а есть только у расширения вне периметра; error — то расширение
+    не применится (в плане — «исправить», в items), risk / info — «уточнить»; как и прочие пункты, в коде, который
+    никто не вызывает, — «проверить». Без ext_all — ключа нет. Ошибки: bad_input (до любого запуска) — реестр, релиз,
+    рабочая копия без git или не корень своего git-репозитория, рабочая копия внутри ext / old / new / ext_all или ext
+    внутри рабочей копии, в ext_all нет выгрузок расширений,
     dump=True у базы с cfe_rebase.proof_corpus (её ext — эталонная выгрузка: только dump=False); external — команда
     выгрузки или git завершились с ошибкой (хвост вывода — в console), выгрузка не уложилась в
     $CFE_REBASE_DUMP_TIMEOUT секунд (по умолчанию 1800; она и запущенные ею процессы остановлены) или не удалось
@@ -1744,6 +1869,18 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
                    "plan": dict(res["plan"]["counts"], hidden=res["plan"]["hidden"])}
         report = dict({"json": res["prepare_json"], "plan": {"json": res["plan"]["json"], "md": res["plan"]["md"]}},
                       **res["reports"])
+        outside = res.get("out_of_perimeter")
+        if outside is not None:
+            def rows(key):
+                return [{"ext": x["ext"], "borrowed": x["borrowed"], "control": x["control"],
+                         "first": plan_mod.cut(x["first"], 300)} for x in outside[key]]
+            summary["out_of_perimeter"] = {"ext_all": outside["ext_all"], "ext_all_newest": outside["ext_all_newest"],
+                                           "perimeter": outside["perimeter"], "extensions": len(outside["extensions"]),
+                                           "not_applied": rows("not_applied"), "control_only": rows("control_only"),
+                                           "clean": len(outside["clean"]),
+                                           "foreign": prep._levels(outside["foreign"])}
+            if outside["reports"]:
+                report["out_of_perimeter"] = outside["reports"]
         items = [_compact({"ext": x["ext"], "module": x["module"], "module_title": x["module_title"],
                            "method": x["method"], "what": x["what"]}) for x in res["plan"]["must_fix"]]
         return {"ext_newest": res["ext_newest"], "summary": summary, "items": items, "report": report}
@@ -1753,7 +1890,7 @@ def prepare(db: str, to: str, from_release: str | None = None, registry: str | N
 
 TOOLS = (list_interceptors, method_diff, rebase_control, check_control, port_replace, check_calls, check_queries,
          applied_text, apply_candidate, apply_borrow_edit, prepare, check_work, check_borrowed, check_registers,
-         check_reads, check_copies, check_names)
+         check_reads, check_copies, check_names, check_template_params)
 
 SELECT_DOC = """\
 Выборка — необязательные параметры, все вместе — через И; применяются до обрезки ответа. summary считает все
@@ -1778,7 +1915,7 @@ accepted — JSON-файл принятых находок: [{"key": …, "reaso
 в порядке отчёта."""
 
 for _fn in (list_interceptors, check_calls, check_queries, check_borrowed, check_registers, check_reads, check_work,
-            check_names):
+            check_names, check_template_params):
     _fn.__doc__ = _fn.__doc__.rstrip() + "\n\n" + "\n".join("    " + s for s in SELECT_DOC.splitlines())
 
 

@@ -26,10 +26,19 @@ Configuration.<old name>» once per role, a real load), ConfigDumpInfo.xml with 
 same real load 20 files carried the old name and the 19 refusals were all roles; another real load passed the
 check with a stale child entry, and the dump after the load wrote the new name there itself - to fix along, not
 proven harmless for a partial load or a dump with -update over the work copy).
+A role the extension owns without Roles/<Роль>/Ext/Rights.xml, in an extension that owns objects roles give rights to,
+is ROLE_NO_RIGHTS (risk): loading from XML creates such a role empty. A real load: the main role of an extension
+gave 130 rights on the extension's own objects in the source base with no Rights.xml in the dump, and had 0 after
+the load; a Rights.xml with setForNewObjects=true and no <object> restored the 130 (proven by a load). A
+role whose rights the dump did lose is not told from a role that has none - the dump holds nothing for either (no
+Role.<Имя>.Rights in ConfigDumpInfo.xml): the source base decides. An adopted role without Rights.xml keeps the
+vendor's rights and is not reported, nor is a role of an extension with no own objects such rights are given to. --ext
+is not needed: a Rights.xml the source had and the work copy lost is FILE_MISSING.
 Lines are split on CR LF, LF and CR only, as the platform and fileio.read_lines count them. Nothing is written outside
 --out, and --out may not be inside --work or --ext.
 
-Severity: error - the platform will refuse the module or the port lost something; info - a removal to confirm.
+Severity: error - the platform will refuse the module or the port lost something; risk - the load will succeed and
+lose something (ROLE_NO_RIGHTS); info - a removal to confirm.
 Exit code 0: findings are data (lint.json, lint.md).
 """
 import argparse
@@ -46,6 +55,18 @@ from .control_rebase import cfg_uuid, inside, work_index
 TEXT_EXT = {".bsl", ".xml", ".txt", ".html", ".htm", ".json", ".css", ".js"}
 STRICT_EXT = {".bsl", ".xml"}  # the platform reads them as UTF-8: a byte that is not UTF-8 is an error
 INFO = {"OBJECT_REMOVED", "CHILD_REMOVED", "OBJECT_RENAMED", "EXT_NAME_STALE_DUMP_INFO"}
+RISK = {"ROLE_NO_RIGHTS"}
+SEVERITIES = ("error", "risk", "info")
+# folders of the objects a role gives rights to: the kinds named in Rights.xml of the roles of УТ 11.5.27.79; the
+# accounting and calculation registers, charts of accounts and calculation types and sequences are not in УТ and are
+# taken by analogy
+RIGHTS_FOLDERS = {"Catalogs", "Documents", "DocumentJournals", "Constants", "InformationRegisters",
+                  "AccumulationRegisters", "AccountingRegisters", "CalculationRegisters", "ChartsOfCharacteristicTypes",
+                  "ChartsOfAccounts", "ChartsOfCalculationTypes", "ExchangePlans", "BusinessProcesses", "Tasks",
+                  "DataProcessors", "Reports", "CommonForms", "CommonCommands", "Subsystems", "SessionParameters",
+                  "CommonAttributes", "FilterCriteria", "Sequences", "WebServices", "HTTPServices",
+                  "IntegrationServices"}
+OWN_NAMED_MAX = 5  # own objects named in the detail of ROLE_NO_RIGHTS
 # where the extension's own name is written besides Configuration.xml: «Configuration.<Имя>» and its children
 RIGHTS_CFG_RE = re.compile(r"<name>\s*Configuration\.([^<.\s]+)[^<]*</name>")
 DUMP_INFO_CFG_RE = re.compile(r'\bname="Configuration\.([^".\s]+)[^"]*"')
@@ -116,6 +137,31 @@ def name_issues(rel, data, name):
         detail += "; полная загрузка по ConfigDumpInfo.xml не отказывает, а выгрузка после неё пишет новое имя сама " \
                   "(проверено на реальных загрузках) — поправить вместе с ролями, чтобы рабочая копия совпала с базой"
     return [{"file": rel, "check": check, "line": line, "detail": detail, "old_name": olds[0], "new_name": name}]
+
+
+def role_issues(work_files):
+    """ROLE_NO_RIGHTS: one per role the extension owns that has no Ext/Rights.xml, when the extension owns objects of
+    RIGHTS_FOLDERS; work_files - files() of the extension."""
+    have = {rel.casefold() for rel in work_files}
+    top = sorted(rel for rel in work_files if rel.count("/") == 1 and rel.lower().endswith(".xml"))
+    roles = [rel[len("Roles/"):-4] for rel in top if rel.split("/")[0] == "Roles"]
+    bare = [r for r in roles if ("Roles/%s/Ext/Rights.xml" % r).casefold() not in have and
+            not metadata.adopted_file(work_files["Roles/%s.xml" % r])]
+    if not bare:
+        return []
+    owned = ["%s.%s" % (metadata.FOLDER2KIND.get(rel.split("/")[0].lower(), rel.split("/")[0]), rel.split("/")[1][:-4])
+             for rel in top if rel.split("/")[0] in RIGHTS_FOLDERS and not metadata.adopted_file(work_files[rel])]
+    if not owned:
+        return []
+    named = ", ".join(owned[:OWN_NAMED_MAX]) + (", …" if len(owned) > OWN_NAMED_MAX else "")
+    return [{"file": "Roles/%s.xml" % r, "check": "ROLE_NO_RIGHTS", "line": 0, "role": r, "own_objects": len(owned),
+             "detail": "у собственной роли %s нет Roles/%s/Ext/Rights.xml, а собственных объектов, на которые роли дают "
+                       "права, у расширения %d (%s): права роли через XML не перенесутся — роль загрузится пустой "
+                       "(реальный случай: 130 прав → 0). Проверить права роли в базе-источнике; "
+                       "если они заданы флагом «Устанавливать права для новых объектов», создать "
+                       "Roles/%s/Ext/Rights.xml (UTF-8 с BOM): setForNewObjects=true, setForAttributesByDefault=true, "
+                       "independentRightsOfChildObjects=false, без <object>; если роль и в базе пустая — принять "
+                       "находку" % (r, r, len(owned), named, r)} for r in bare]
 
 
 def eol(data):
@@ -284,16 +330,17 @@ def lint(work, ext=None, only=None):
             found.extend(issues_of_file)
             if not any(x["check"] == "ENCODING" for x in issues_of_file):
                 found.extend(name_issues(rel, data, w.name))
+        found.extend(role_issues(wf))
         if src is not None:
             found.extend(compare(src.root, w.root, files(src.root), wf))
         for it in found:
             it.update(ext=w.name, source=src.name if src is not None else None,
-                      severity="info" if it["check"] in INFO else "error",
+                      severity="info" if it["check"] in INFO else "risk" if it["check"] in RISK else "error",
                       path=os.path.join(w.root, *it["file"].split("/")))
             issues.append(it)
     if unmatched:
         stats["without_source_names"] = unmatched
-    issues.sort(key=lambda x: (x["severity"] != "error", x["ext"], x["file"], x["line"]))
+    issues.sort(key=lambda x: (SEVERITIES.index(x["severity"]), x["ext"], x["file"], x["line"]))
     return issues, stats
 
 
@@ -308,8 +355,8 @@ def render(args, issues, stats, elapsed):
             stats["without_source"], ", ".join("`%s`" % n for n in stats.get("without_source_names", []))))
     counts = Counter(x["check"] for x in issues)
     md.append("")
-    md.append("Ошибок: %d, к подтверждению: %d." % (sum(1 for x in issues if x["severity"] == "error"),
-                                                    sum(1 for x in issues if x["severity"] == "info")))
+    md.append("Ошибок: %d, рисков: %d, к подтверждению: %d." % tuple(sum(1 for x in issues if x["severity"] == s)
+                                                                     for s in SEVERITIES))
     if counts:
         md.append("")
         md.append(fileio.md_table(["Проверка", "Находок"], sorted(counts.items())))
@@ -354,9 +401,9 @@ def main(argv=None):
     elapsed = time.time() - t0
     data = {"work": args.work, "ext": args.ext, "only": args.only, "stats": dict(stats), "issues": issues}
     md_path, json_path = fileio.write_report(args.out, "lint", render(args, issues, stats, elapsed), data)
-    errors = sum(1 for x in issues if x["severity"] == "error")
-    print("extensions: %d, files: %d, modules: %d, errors: %d, to confirm: %d, %.1fs" % (
-        stats["extensions"], stats["files"], stats["modules"], errors, len(issues) - errors, elapsed))
+    errors, risks, info = (sum(1 for x in issues if x["severity"] == s) for s in SEVERITIES)
+    print("extensions: %d, files: %d, modules: %d, errors: %d, risks: %d, to confirm: %d, %.1fs" % (
+        stats["extensions"], stats["files"], stats["modules"], errors, risks, info, elapsed))
     counts = Counter(x["check"] for x in issues)
     if counts:
         print("checks: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))

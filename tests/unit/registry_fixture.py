@@ -10,6 +10,8 @@ never reach a message.
 """
 import json
 import os
+import re
+import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +49,80 @@ for name in names.split(","):
     shutil.copytree(os.path.join(@EXT@, name), os.path.join(dst, name))
 print("dumped", db, names)
 '''
+
+
+EXT_ALL_V2 = EXT_PRINT + "_v2"  # the perimeter extension renamed in the base: the uuid of Configuration is the same
+EXT_FOREIGN = "Синт_Чужое"      # outside, not applied: CompatibilityMode differs from new; adds Константа.Синт_Дата
+EXT_CLEAN = "Синт_Чистое"       # outside, clean: adds Справочник.Синт_Склады2
+FOREIGN_CODE = (
+    "\r\n// ЕГ: обращения к объектам других расширений базы\r\n"
+    "&Перед(\"ЗаписатьСобытие\")\r\n"
+    "Процедура Синт_ПередЗаписьюСобытия(Запись)\r\n"
+    "\tСинт_ДатаНачала();\r\n"
+    "\tСинт_Склады();\r\n"
+    "КонецПроцедуры\r\n"
+    "\r\n"
+    "Функция Синт_ДатаНачала()\r\n"
+    "\t// Константы.Синт_Дата в комментарии - не код\r\n"
+    "\tДата = Константы.Синт_Дата.Получить();\r\n"
+    "\tЕсли Метаданные.Константы.Найти(\"Синт_Дата\") = Неопределено Тогда\r\n"
+    "\t\tВозврат Документы.ЗаказПокупателя.ПустаяСсылка();\r\n"
+    "\tКонецЕсли;\r\n"
+    "\tНеизвестная = Константы.НетНигде.Получить();\r\n"
+    "\tВозврат Дата;\r\n"
+    "КонецФункции\r\n"
+    "\r\n"
+    "Функция Синт_Склады()\r\n"
+    "\tЗапрос = Новый Запрос(\"ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Синт_Склады2 КАК Т\");\r\n"
+    "\tВозврат Запрос;\r\n"
+    "КонецФункции\r\n")
+OWN_OBJECT = ('<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+              'version="2.20">\n<%s uuid="%s"><Properties><Name>%s</Name></Properties></%s></MetaDataObject>\n')
+
+
+def _bom_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"\xef\xbb\xbf" + text.encode("utf-8"))
+
+
+def _clone(src, dst, name, uuid=None, compat=None):
+    """A copy of an extension dump under another Name (and uuid of Configuration, CompatibilityMode)."""
+    shutil.copytree(src, dst)
+    cfg = os.path.join(dst, "Configuration.xml")
+    with open(cfg, encoding="utf-8-sig") as fh:
+        text = fh.read()
+    text = re.sub(r"<Name>[^<]*</Name>", "<Name>%s</Name>" % name, text, count=1)
+    if uuid:
+        text = re.sub(r'<Configuration uuid="[^"]*"', '<Configuration uuid="%s"' % uuid, text, count=1)
+    if compat:
+        text = text.replace("<DefaultRunMode>", "<CompatibilityMode>%s</CompatibilityMode>\n\t\t\t<DefaultRunMode>"
+                            % compat, 1)
+    _bom_write(cfg, text)
+
+
+def make_ext_all(task):
+    """(ext, ext_all) under task: ext - the perimeter, Синт_Печать with FOREIGN_CODE appended to its module;
+    ext_all - all extensions of the base: Синт_Печать_v2 (the perimeter renamed), Синт_Основное (outside, its
+    &ИзменениеИКонтроль fail on new), Синт_Чужое (not applied, own constant Синт_Дата), Синт_Чистое (clean, own
+    catalog Синт_Склады2)."""
+    ext = os.path.join(task, "before", "xml")
+    ext_all = os.path.join(task, "all", "xml")
+    shutil.copytree(os.path.join(EXT, EXT_PRINT), os.path.join(ext, EXT_PRINT))
+    module = os.path.join(ext, EXT_PRINT, "CommonModules", "ЗаказыСервер", "Ext", "Module.bsl")
+    with open(module, "ab") as fh:
+        fh.write(FOREIGN_CODE.encode("utf-8"))
+    _clone(os.path.join(ext, EXT_PRINT), os.path.join(ext_all, EXT_ALL_V2), EXT_ALL_V2)
+    shutil.copytree(os.path.join(EXT, EXT_MAIN), os.path.join(ext_all, EXT_MAIN))
+    _clone(os.path.join(EXT, EXT_PRINT), os.path.join(ext_all, EXT_FOREIGN), EXT_FOREIGN,
+           "0b1f0000-0000-4000-8000-000000000001", "Version8_3_24")
+    _bom_write(os.path.join(ext_all, EXT_FOREIGN, "Constants", "Синт_Дата.xml"),
+               OWN_OBJECT % ("Constant", "0b1f0000-0000-4000-8000-0000000000c1", "Синт_Дата", "Constant"))
+    _clone(os.path.join(EXT, EXT_PRINT), os.path.join(ext_all, EXT_CLEAN), EXT_CLEAN,
+           "0b1f0000-0000-4000-8000-000000000002")
+    _bom_write(os.path.join(ext_all, EXT_CLEAN, "Catalogs", "Синт_Склады2.xml"),
+               OWN_OBJECT % ("Catalog", "0b1f0000-0000-4000-8000-0000000000c2", "Синт_Склады2", "Catalog"))
+    return ext, ext_all
 
 
 def make(base, db_cfg=None, extensions=None, dump=True, releases=None):
