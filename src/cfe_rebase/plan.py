@@ -25,8 +25,10 @@ One item per extension + module + method (or call site / query place), grouped:
   CLARIFY  - questions of design: the same target in several extensions, CALLERS_LOST of a method with many vendor
              callers or lost only with the vendor methods that called it, a base method new in this release, an
              interception of a method that was not in old, an adopted object or field in neither release, an object
-             or register XML that does not parse (look at the file), a list field the extension's UseAlways may not
-             load (names: LIST_FIELD_NOT_LOADED - whether the platform replaces or merges UseAlways is not proven);
+             or register XML that does not parse (look at the file), an object the extension creates and writes in
+             code whose vendor write handlers refuse more in new (calls: WRITE_CHECKS_NEW), a list field the
+             extension's UseAlways may not load (names: LIST_FIELD_NOT_LOADED - whether the platform replaces or
+             merges UseAlways is not proven);
   the rest is counted by kind only (DEAD_BINDING, DIRECTIVE_MISMATCH, a vendor change under &Перед / &После, a
   compatible signature change, query fields that do not depend on the release).
 The rules come from three hand-made ports (UT 11.5.22 -> 11.5.27): the human changed 41 of the 45 MUST_FIX items; of
@@ -192,7 +194,9 @@ def _calls(p, calls):
         copy = f.get("copy")
         dep_risk = (f.get("deprecated") or {}).get("grade") == "risk"
         rest = [x for x in flags if x != "CALLS_DEPRECATED"]
-        if flags == ["STRUCT_KEY_NEW"]:  # error and risk alike: the vendor reads a key the structure lacks
+        if flags == ["WRITE_CHECKS_NEW"]:  # new refusals of the vendor: whether the data passes them is a question
+            p.add("CLARIFY", *args, what, "calls:WRITE_CHECKS_NEW", f.get("module_title"))
+        elif flags == ["STRUCT_KEY_NEW"]:  # error and risk alike: the vendor reads a key the structure lacks
             p.add("MUST_FIX", *args, what + ("; " + f["advice"] if f.get("advice") else ""), "calls:STRUCT_KEY_NEW",
                   f.get("module_title"))
         elif copy and copy.get("target_in_new") and copy.get("vendor_old") and not copy.get("vendor_new"):

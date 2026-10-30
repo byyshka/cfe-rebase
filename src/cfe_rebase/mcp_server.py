@@ -78,7 +78,7 @@ INTERCEPTOR_FIELDS = ("id", "ext", "module_title", "source", "kind", "target", "
                       "callers_lost", "callers_new", "vendor_mentions",
                       "callers_moved_deeper", "replacement")
 CALL_FIELDS = ("ext", "module_title", "line", "caller", "call", "args", "target", "flags", "note", "deprecated", "copy",
-               "advice", "owner", "struct_key")
+               "advice", "owner", "struct_key", "write_checks")
 QUERY_FIELDS = ("part", "kind", "sev", "ext", "where", "line", "ref", "note", "old")
 REGISTER_FIELDS = ("ext", "module_title", "line", "method", "register", "how", "check", "added", "missing", "stale",
                    "to_dims", "to_res", "key_lost", "callers", "detail")
@@ -955,10 +955,15 @@ def check_calls(ext_root: list[str] | None = None, config_old: str | None = None
     структура до вызова никуда не передаётся, risk — иначе; arg, param, var, built_line, keys, reads [{key, module,
     method, line}], vendor_puts — где вендор в new кладёт ключ сам, passed_on}, advice — переснять копию, если вызов
     в копии &Вместо / &ИзменениеИКонтроль, а вендор кладёт ключ в самом перехваченном методе; структура из параметра
-    или функции не судится (только счёт struct_key_unchecked в report), grade у
+    или функции не судится (только счёт struct_key_unchecked в report); WRITE_CHECKS_NEW — расширение создаёт объект
+    кодом (<Коллекция>.<Имя>.Создать…) и записывает его (<Перем>.Записать), а вендор в new добавил отказы в обработчики
+    записи объекта (Отказ, ВызватьИсключение в ПередЗаписью, ПриЗаписи; при записи документа с проведением — ещё
+    ОбработкаПроверкиЗаполнения, ОбработкаПроведения): запись может не пройти — сверить с данными, которые кладёт код;
+    отдельная строка с write_checks {object, line_created, posting, handlers [{handler, old, new — [Отказ,
+    ВызватьИсключение], old null — обработчика в old не было}]}, grade у
     SIGNATURE_CHANGED: risk | info (info — вызов совместим, в том числе когда у параметров сменились только имена:
-    число, порядок, Знач и умолчания прежние), note — пояснение. Вызов внутри копии &Вместо / &ИзменениеИКонтроль в заимствованном
-    модуле — ещё copy {annotation, target_in_new (перехватываемый метод есть в new), vendor_old / vendor_new (тот же
+    число, порядок, Знач и умолчания прежние), note — пояснение. Вызов внутри копии &Вместо / &ИзменениеИКонтроль в
+    заимствованном модуле — ещё copy {annotation, target_in_new (перехватываемый метод есть в new), vendor_old / vendor_new (тот же
     вызов есть в теле вендора old / new), new_as (как new вызывает тот же метод с другим квалификатором — куда вендор
     его перенёс)} и advice: «переснять копию по new» (вызов из текста вендора, в new его нет — находка уходит
     пересъёмкой, замену методу искать не надо), «правка автора», MISSING_BASE. summary — счёты флагов, risk / info,
@@ -966,7 +971,8 @@ def check_calls(ext_root: list[str] | None = None, config_old: str | None = None
     report.md.
     Выборка — общие параметры, описаны в конце: flag — флаги и risk / info у SIGNATURE_CHANGED; уровни severity:
     error — OWNER_REMOVED, OWNER_RENAMED, REMOVED, MISSING, NOT_EXPORT, TOO_FEW_ARGS, TOO_MANY_ARGS, STRUCT_KEY_NEW
-    error; risk — SIGNATURE_CHANGED risk, CALLS_DEPRECATED risk, STRUCT_KEY_NEW risk; info — SIGNATURE_CHANGED info
+    error; risk — SIGNATURE_CHANGED risk, CALLS_DEPRECATED risk, STRUCT_KEY_NEW risk, WRITE_CHECKS_NEW; info —
+    SIGNATURE_CHANGED info
     (вызов совместим), CALLS_DEPRECATED info; ключ — ext|module|caller|call|flags."""
     inputs = {"ext_root": ext_root, "config_old": config_old, "config_new": config_new, "out": out, "skip": skip,
               "db": db, "to": to, "from_release": from_release, "registry": registry, "module": module,

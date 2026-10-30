@@ -25,9 +25,9 @@ the extension root, its title such as Документ.X.МодульОбъек�
 «|»; object - a metadata object as a whole name segment (Документ.ЗаказКлиента, ЗаказКлиента or
 Documents/ЗаказКлиента), matched against the object the finding is in or about; flag - any of the flags, checks or
 severities of the finding (calls: OWNER_REMOVED … SIGNATURE_CHANGED and risk / info of it, STRUCT_KEY_NEW and error /
-risk of it; queries: sev, kind, part, old; borrowed, reads, registers, lint: check; names: check, how, level;
-template-params: check, sev; interceptors: flags); severity - the lowest
-level to keep (error: errors only, risk: errors and risks, info: everything).
+risk of it, WRITE_CHECKS_NEW; queries: sev, kind, part, old; borrowed, reads, registers, lint: check; names: check,
+how, level; template-params: check, sev; interceptors: flags); severity - the lowest level to keep (error: errors only,
+risk: errors and risks, info: everything).
 Extensions renamed between the baseline and the current run (a work copy is renamed «<name>_<release>_<date>_v_…»):
 the MCP server pairs them by the uuid of Configuration when both sides are dumps; otherwise, when exactly one name of
 each side has no pair, the two are one extension, and a current name that starts with exactly one unpaired baseline
@@ -99,6 +99,8 @@ def _calls_level(row):
     if "STRUCT_KEY_NEW" in flags:  # a row of its own (calls.struct_keys): error or risk by the structure's origin
         grade = (row.get("struct_key") or {}).get("grade")
         return grade if grade in LEVELS else "risk"
+    if "WRITE_CHECKS_NEW" in flags:  # a row of its own (calls.write_checks): refusals to check against the data
+        return "risk"
     if flags - {"SIGNATURE_CHANGED", "CALLS_DEPRECATED"}:
         return "error"
     return "risk" if flags and _risk_call(row) else "info"
@@ -128,7 +130,8 @@ SPECS = {
               lambda r: _first(CALL_ERRORS, _l(r.get("flags"))),
               lambda r: [r.get("module"), r.get("module_title"), r.get("caller")],
               lambda r: [r.get("module_title"), r.get("module"), r.get("target")],
-              lambda r: _l(r.get("flags")) + ([_calls_level(r)] if "STRUCT_KEY_NEW" in _l(r.get("flags")) else
+              lambda r: _l(r.get("flags")) + ([_calls_level(r)] if {"STRUCT_KEY_NEW", "WRITE_CHECKS_NEW"} &
+                                              set(_l(r.get("flags"))) else
                                               ["risk" if _risk_call(r) else "info"]
                                               if {"SIGNATURE_CHANGED", "CALLS_DEPRECATED"} & set(_l(r.get("flags")))
                                               else [])),

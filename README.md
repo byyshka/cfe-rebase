@@ -14,7 +14,7 @@
 раздел ниже. Из командной строки нейросеть не нужна вовсе. Как MCP-сервер пакет проверен только с Claude Code:
 протокол стандартный (stdio), но размер ответов и порядок работы в инструкции сервера подбирались под него.
 
-Версия 0.3.6: ядро, CLI, MCP-сервер, реестр баз, план адаптации, проверки заимствований, чтения регистров, имён
+Версия 0.3.7: ядро, CLI, MCP-сервер, реестр баз, план адаптации, проверки заимствований, чтения регистров, имён
 форм и рабочей копии, правка заимствований. Что доказано на переносах УТ и 218 расширениях ERP 2.5, а где есть оговорки — в `docs/VALIDATION.md`.
 
 Требования: Python 3.12+, `git` в `PATH` (трёхстороннее слияние — `git merge-file`). Сторонних зависимостей у ядра
@@ -130,7 +130,7 @@ Windows: пути синтетического корпуса доходят д�
 | Команда | Что делает |
 |---|---|
 | `interceptors` | реестр перехватов расширений против нового релиза и мёртвый код расширений; перехват метода, который вендор пометил устаревшим (`TARGET_DEPRECATED`), и такого, который код вендора в new больше не вызывает нигде (`TARGET_UNCALLED`) или на части путей (`CALLERS_LOST`) |
-| `calls` | вызовы методов конфигурации из расширений: наличие метода и число параметров в новом релизе, вызов метода, устаревшего в этом релизе (`CALLS_DEPRECATED`), ключ параметра-структуры, который вендор начал читать, а расширение в свою структуру не кладёт (`STRUCT_KEY_NEW`), вызов в модуль заимствованного объекта, который вендор удалил или переименовал, — и собственного метода расширения там (`OWNER_REMOVED` / `OWNER_RENAMED`); у вызова внутри копии `&Вместо` / `&ИзменениеИКонтроль` — уйдёт ли он пересъёмкой копии и как его теперь вызывает вендор |
+| `calls` | вызовы методов конфигурации из расширений: наличие метода и число параметров в новом релизе, вызов метода, устаревшего в этом релизе (`CALLS_DEPRECATED`), ключ параметра-структуры, который вендор начал читать, а расширение в свою структуру не кладёт (`STRUCT_KEY_NEW`), объект, который расширение создаёт и записывает кодом, а вендор добавил отказы в его обработчики записи (`WRITE_CHECKS_NEW`), вызов в модуль заимствованного объекта, который вендор удалил или переименовал, — и собственного метода расширения там (`OWNER_REMOVED` / `OWNER_RENAMED`); у вызова внутри копии `&Вместо` / `&ИзменениеИКонтроль` — уйдёт ли он пересъёмкой копии и как его теперь вызывает вендор |
 | `bodies` | замороженные копии `&Вместо` против тела метода в старом и новом релизе: изменения вендора old→new, которые уже в копии (`in_copy`), и основа копии по ним (`new`, `mixed`, `old`, `older`); копия и обработчик события заимствованной формы, назначенный в `Form.xml` с `callType="Override"` без `ПродолжитьВызов` (`binding: callType`, вид «Вместо (callType)», цель — обработчик события в форме вендора) |
 | `queries` | тексты запросов, схемы СКД и имена метаданных в строках против нового релиза |
 | `merge-copy` | перенос одной копии `&Вместо` на тело нового релиза трёхсторонним слиянием; конфликты из одних пробелов разрешаются, вставки в одной точке помечаются; блок автора под другими условиями (`AUTHOR_BLOCK_MOVED`), вынесенное вендором тело (`BODY_EXTRACTED`); обёртку с `ПродолжитьВызов` не сливает |
@@ -475,7 +475,7 @@ claude mcp add -s user cfe-rebase -- cfe-rebase mcp
 
 | Инструмент | `error` | `risk` | `info` | Ключ |
 |---|---|---|---|---|
-| `check_calls` | `OWNER_REMOVED`, `OWNER_RENAMED`, `REMOVED`, `MISSING`, `NOT_EXPORT`, `TOO_FEW_ARGS`, `TOO_MANY_ARGS`, `STRUCT_KEY_NEW` error | `SIGNATURE_CHANGED` risk, `CALLS_DEPRECATED` risk, `STRUCT_KEY_NEW` risk | `SIGNATURE_CHANGED` info, `CALLS_DEPRECATED` info (вендор сам вызывает метод в new) | `ext\|module\|caller\|call\|flags` |
+| `check_calls` | `OWNER_REMOVED`, `OWNER_RENAMED`, `REMOVED`, `MISSING`, `NOT_EXPORT`, `TOO_FEW_ARGS`, `TOO_MANY_ARGS`, `STRUCT_KEY_NEW` error | `SIGNATURE_CHANGED` risk, `CALLS_DEPRECATED` risk, `STRUCT_KEY_NEW` risk, `WRITE_CHECKS_NEW` | `SIGNATURE_CHANGED` info, `CALLS_DEPRECATED` info (вендор сам вызывает метод в new) | `ext\|module\|caller\|call\|flags` |
 | `check_queries` | `ОШИБКА?` | `РИСК` | `ПРОВЕРИТЬ` (внутри уровня первыми — «было корректно») | `ext\|file\|where\|part\|kind\|ref` |
 | `check_borrowed` | `COMPAT_MODE`, `OBJECT_REMOVED`, `OBJECT_RENAMED`, `OBJECT_NAME_CLASH`, `REMOVED`, `RENAMED`, `TYPE_CHANGED`, `PROPERTY_CHANGED`, `LIST_FIELD_LOST`, `NAME_CLASH` | `XML_UNREADABLE`, `LIST_CHANGED` | `NOT_IN_VENDOR` | `ext\|object\|part\|name\|check` |
 | `check_registers` | `REGISTER_REMOVED`, непустые `stale` или `key_lost` | остальное | — | `ext\|module\|method\|register\|check` |
@@ -533,7 +533,7 @@ flagged, `registers` the writes to registers whose dimensions changed, `reads` (
 the registers extension queries read whose composition or recorders changed, and `lint` a ported work copy before it is
 loaded; `borrow-edit` removes an adoption or renames it to the vendor's new name (vendor renames keep the uuid, and
 every check matches adopted objects by it). Python 3.12+, `git` on `PATH`, no third-party dependencies in the core, no
-1C platform needed. Version 0.3.6,
+1C platform needed. Version 0.3.7,
 tested on four extension migrations of real 1C:Trade Management bases 11.5.22.159 → 11.5.27.79;
 neither vendor configuration code nor customer extensions are part of the repository — the tests run on a synthetic
 corpus. Documentation is in Russian. License: AGPL-3.0 (© 2026 byyshka); closed-source use requires a separate

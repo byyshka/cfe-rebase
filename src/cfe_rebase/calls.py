@@ -28,6 +28,9 @@ module).
 STRUCT_KEY_NEW (struct_keys): the vendor method reads a key of a structure parameter in new it did not read in old, and
 the extension builds that structure itself without the key - a row of its own per argument (a real case: ОпцииПечати of
 ЗаполнитьРеквизитыШапкиУПД without ВерсияПостановления1137).
+WRITE_CHECKS_NEW (write_checks): the extension creates an object in code (<Коллекция>.<Имя>.Создать…) and writes it, and
+the vendor added refusals (Отказ, ВызватьИсключение) to its write handlers in new - a risk, a row of its own (a real
+case: Задача.ЗадачаИсполнителя.ПередЗаписью refuses a performer marked invalid in 11.5.27).
 """
 import argparse
 import os
@@ -35,7 +38,7 @@ import sys
 import time
 from collections import defaultdict, OrderedDict
 
-from . import bsl, fileio, metadata, refs, struct_keys
+from . import bsl, fileio, metadata, refs, struct_keys, write_checks
 from .control_rebase import refuse_out_inside
 
 PLATFORM_MANAGER = {x.lower() for x in """
@@ -88,9 +91,12 @@ EXPLAIN = OrderedDict([
                          "(устаревшие и в old — только счётом)"),
     ("STRUCT_KEY_NEW", "метод вендора в new читает ключ параметра-структуры, которого не читал в old, а расширение "
                        "строит эту структуру само и ключ не кладёт: «Поле объекта не обнаружено» (struct_keys)"),
+    ("WRITE_CHECKS_NEW", "расширение создаёт объект кодом и записывает его, а вендор в new добавил отказы в его "
+                         "обработчики записи (Отказ, ВызватьИсключение): запись может не пройти (write_checks)"),
 ])
 SEVERITY = {"OWNER_REMOVED": 0, "OWNER_RENAMED": 0, "REMOVED": 0, "MISSING": 1, "NOT_EXPORT": 1, "TOO_FEW_ARGS": 0,
-            "TOO_MANY_ARGS": 0, "SIGNATURE_CHANGED": 3, "CALLS_DEPRECATED": 2, "STRUCT_KEY_NEW": 1}
+            "TOO_MANY_ARGS": 0, "SIGNATURE_CHANGED": 3, "CALLS_DEPRECATED": 2, "STRUCT_KEY_NEW": 1,
+            "WRITE_CHECKS_NEW": 2}
 
 
 def kind_rel(kind, name, part):
@@ -412,12 +418,16 @@ def analyze(args):
     index = refs.build(exts, refs.form_cache())
     findings = []
     stats = defaultdict(int)
+    wc_cache = {}
     for ext in exts:
         for rel in ext.files(".bsl"):
             mod = ext.module(rel)
             if mod is None:
                 continue
             stats["modules"] += 1
+            for f in write_checks.check(ext, rel, mod, cfg_old, cfg_new, wc_cache):
+                f["caller_live"] = index.liveness(rel, mod.find(f["caller"]))
+                findings.append(f)
             # a vendor rename keeps the uuid: the module of a renamed object is under its name in each release
             rel_new = metadata.counterpart_rel(ext, rel, cfg_new)[0]
             rel_old = metadata.counterpart_rel(ext, rel, cfg_old)[0] if cfg_old is not None else rel
@@ -683,7 +693,8 @@ def render(cfg_new, cfg_old, exts, findings, stats, elapsed):
         ["Флаги", "Расширение", "Модуль:строка", "В методе (живость)", "Вызов", "Арг.", "Сигнатура new", "Сигнатура old",
          "Пояснение"],
         [(", ".join(f["flags"]), f["ext"], "%s:%d" % (f["module_title"], f["line"]),
-          "%s (%s)" % (f["caller"] or "—", f["caller_live"]), f["call"], f["args"], f["sig_new"] or "—",
+          "%s (%s)" % (f["caller"] or "—", f["caller_live"]), f["call"], "—" if f["args"] is None else f["args"],
+          f["sig_new"] or "—",
           f["sig_old"] or "—", f["note"] + ("; " + f["advice"] if f.get("advice") else "")) for f in main]))
     md.append("")
     md.append("## SIGNATURE_CHANGED без риска для вызова — %d" % len(info))
